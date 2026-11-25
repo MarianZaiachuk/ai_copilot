@@ -72,6 +72,10 @@ hiddenimports = (
         "scipy.special._ufuncs_cxx",
         "google.genai",
         "openai",
+        "elevenlabs",
+        "httpx",
+        "httpcore",
+        "h11",
         "pypdf",
         "docx",
         "dotenv",
@@ -84,6 +88,8 @@ hiddenimports = (
     ]
     + collect_submodules("ddgs")
     + collect_submodules("primp")
+    + collect_submodules("websockets")
+    + collect_submodules("elevenlabs")
 )
 
 a = Analysis(

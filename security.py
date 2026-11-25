@@ -15,7 +15,7 @@ _IGNORED_SECRETS: frozenset[str] = frozenset({"ollama", "lm-studio", "none", "nu
 
 _GOOGLE_KEY_RE = re.compile(r"AIza[0-9A-Za-z_\-]{20,}")
 _PREFIX_KEY_RE = re.compile(
-    r"(?<![0-9A-Za-z_\-])(?:sk-(?:proj-|svcacct-|ant-)?|gsk_|pplx-|hf_|xai-|ghp_|github_pat_)[0-9A-Za-z_\-]{12,}"
+    r"(?<![0-9A-Za-z_\-])(?:sk-(?:proj-|svcacct-|ant-)?|gsk_|csk-|pplx-|hf_|xai-|ghp_|github_pat_)[0-9A-Za-z_\-]{12,}"
 )
 _TAVILY_KEY_RE = re.compile(r"\btvly-[A-Za-z0-9_-]{12,}")
 _BRAVE_KEY_RE = re.compile(r"\bBSA[A-Za-z0-9_-]{16,}")
@@ -23,9 +23,10 @@ _QUERY_SECRET_RE = re.compile(
     r"(?i)([?&](?:key|api_?key|x-api-key|token|access_token|secret|password)=)([^&\s\"']+)"
 )
 _BEARER_RE = re.compile(r"(?i)(\bBearer\s+)([A-Za-z0-9._~+/=-]{8,})")
+_TOKEN_AUTH_RE = re.compile(r"(?i)(\bToken\s+)([A-Za-z0-9._~+/=-]{8,})")
 _BASIC_AUTH_RE = re.compile(r"(?i)(\bBasic\s+)([A-Za-z0-9+/=]{8,})")
 _HEADER_SECRET_RE = re.compile(
-    r"(?i)(\b(?:X-Subscription-Token|x-goog-api-key|x-api-key)\s*:\s*)([^\s,;\"']{8,})"
+    r"(?i)(\b(?:X-Subscription-Token|x-goog-api-key|x-api-key|xi-api-key)\s*:\s*)([^\s,;\"']{8,})"
 )
 _JSON_SECRET_RE = re.compile(
     r'(?i)("(?:api_?key|secret|token|password|access_token)"\s*:\s*")([^"]{6,})(")'
@@ -61,6 +62,7 @@ def redact_secrets(text: str, extra_secrets: Iterable[str] = ()) -> str:
     result = _BRAVE_KEY_RE.sub("***REDACTED***", result)
     result = _QUERY_SECRET_RE.sub(r"\1***REDACTED***", result)
     result = _BEARER_RE.sub(r"\1***REDACTED***", result)
+    result = _TOKEN_AUTH_RE.sub(r"\1***REDACTED***", result)
     result = _BASIC_AUTH_RE.sub(r"\1***REDACTED***", result)
     result = _HEADER_SECRET_RE.sub(r"\1***REDACTED***", result)
     result = _JSON_SECRET_RE.sub(r"\1***REDACTED***\3", result)

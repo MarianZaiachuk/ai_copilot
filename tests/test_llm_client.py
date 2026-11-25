@@ -34,10 +34,13 @@ def test_2026_defaults_and_xml_delimited_prompts() -> None:
     assert "<live_transcript>" in concise
     assert "<user_question>" in concise
     assert concise.index("<documents_context>") < concise.index("<live_transcript>")
-    assert "3–5" in concise
+    assert "system prompt" in concise
+    assert "українською" not in concise
+    assert "3–5" not in concise
 
     detailed = llm_client.build_user_prompt("Що таке WASAPI?", detail_mode="detailed")
-    assert "розгорнуту" in detailed
+    assert "detailed" in detailed
+    assert "<documents_context>" not in detailed
 
 
 def test_list_available_models_filtering_for_gemini_and_groq() -> None:
@@ -289,3 +292,33 @@ def test_think_filter_error_classification_history_and_response_cache() -> None:
         assert c3 == ["- Оновлена теза"]
         assert used_routes[-1] == ("gpt-6-luna", "")
         assert fake_oai.chat.completions.create.call_count == 2
+
+
+def test_cerebras_provider_settings_sorting_and_redaction() -> None:
+    from security import redact_secrets
+
+    assert "cerebras" in config.VALID_LLM_PROVIDERS
+
+    cfg_with_key = config.AppConfig(
+        llm_provider="cerebras",
+        openai_api_key="csk-1234567890abcdef",
+        openai_model="qwen-3.8-27b",
+    )
+    cfg_no_key = config.AppConfig(llm_provider="cerebras", openai_api_key="")
+
+    assert config.has_valid_llm_credentials(cfg_with_key) is True
+    assert config.has_valid_llm_credentials(cfg_no_key) is False
+    assert llm_client.resolve_openai_settings(cfg_with_key) == (
+        "csk-1234567890abcdef",
+        "https://api.cerebras.ai/v1",
+    )
+
+    ordered = llm_client._sort_openai_models(
+        ["llama-3.3-70b", "gpt-oss-120b", "qwen-3.8-27b"],
+        "cerebras",
+    )
+    assert ordered == ["qwen-3.8-27b", "gpt-oss-120b", "llama-3.3-70b"]
+
+    masked = redact_secrets("Authorization: csk-1234567890abcdef")
+    assert "csk-1234567890abcdef" not in masked
+    assert "***REDACTED***" in masked

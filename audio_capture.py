@@ -18,6 +18,85 @@ logger = logging.getLogger(__name__)
 
 TARGET_SAMPLE_RATE = 16000
 _PYAUDIO_LOCK = threading.Lock()
+_SILERO_FRAME_SAMPLES = 512
+_SILERO_CONTEXT_SAMPLES = 64
+
+
+class StreamingSileroVAD:
+    """Stateful chunk-by-chunk Silero VAD scorer over 16 kHz mono float32 audio."""
+
+    def __init__(self) -> None:
+        self._session = None
+        self.available = False
+        self._h = np.zeros((1, 1, 128), dtype=np.float32)
+        self._c = np.zeros((1, 1, 128), dtype=np.float32)
+        self._context = np.zeros((1, _SILERO_CONTEXT_SAMPLES), dtype=np.float32)
+        self._pending = np.empty(0, dtype=np.float32)
+        self.last_prob = 0.0
+        try:
+            from faster_whisper.vad import get_vad_model
+
+            vad_model = get_vad_model()
+            session = getattr(vad_model, "session", None)
+            if session is not None:
+                self._session = session
+                self.available = True
+        except Exception as exc:
+            logger.debug("Silero VAD unavailable, falling back to RMS VAD: %s", exc)
+            self.available = False
+
+    def reset(self) -> None:
+        self._h.fill(0.0)
+        self._c.fill(0.0)
+        self._context.fill(0.0)
+        self._pending = np.empty(0, dtype=np.float32)
+        self.last_prob = 0.0
+
+    def score_block(self, block_16k: np.ndarray) -> float:
+        """Process 16 kHz mono samples and return max speech probability in [0, 1], or -1.0 if unavailable."""
+        if not self.available or self._session is None:
+            return -1.0
+        arr = np.nan_to_num(
+            np.asarray(block_16k, dtype=np.float32).reshape(-1),
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        )
+        if arr.size == 0:
+            return self.last_prob
+
+        self._pending = arr if self._pending.size == 0 else np.concatenate((self._pending, arr))
+        if self._pending.size < _SILERO_FRAME_SAMPLES:
+            return self.last_prob
+
+        max_prob = 0.0
+        pos = 0
+        total = self._pending.size
+        while pos + _SILERO_FRAME_SAMPLES <= total:
+            frame = self._pending[pos : pos + _SILERO_FRAME_SAMPLES].reshape(1, _SILERO_FRAME_SAMPLES)
+            x = np.concatenate((self._context, frame), axis=1)
+            try:
+                out, hn, cn = self._session.run(None, {"input": x, "h": self._h, "c": self._c})
+                self._h = hn
+                self._c = cn
+                self._context = frame[:, -_SILERO_CONTEXT_SAMPLES:].copy()
+                prob = float(np.asarray(out).reshape(-1)[0])
+                if prob > max_prob:
+                    max_prob = prob
+            except Exception as exc:
+                logger.warning("Silero VAD frame inference failed, falling back to RMS: %s", exc)
+                self.available = False
+                self._pending = np.empty(0, dtype=np.float32)
+                return -1.0
+            pos += _SILERO_FRAME_SAMPLES
+
+        self._pending = (
+            np.ascontiguousarray(self._pending[pos:], dtype=np.float32)
+            if pos < total
+            else np.empty(0, dtype=np.float32)
+        )
+        self.last_prob = max_prob
+        return max_prob
 
 
 @dataclass(frozen=True)
@@ -165,6 +244,9 @@ class AudioChunker:
         pre_roll_seconds: float = 0.4,
         sample_rate: int = TARGET_SAMPLE_RATE,
         max_chunk_seconds: float | None = None,
+        vad_fn: Callable[[np.ndarray], float] | None = None,
+        vad_threshold: float = 0.42,
+        vad_release_threshold: float = 0.25,
     ) -> None:
         self.sample_rate = max(1000, int(sample_rate))
         self.target_chunk_seconds = max(1.0, float(target_chunk_seconds))
@@ -173,6 +255,9 @@ class AudioChunker:
         self.silence_threshold = max(1e-5, float(silence_threshold))
         self.min_speech_seconds = max(0.2, float(min_speech_seconds))
         self.pre_roll_seconds = max(0.0, float(pre_roll_seconds))
+        self._vad_fn = vad_fn
+        self._vad_threshold = float(vad_threshold)
+        self._vad_release_threshold = float(vad_release_threshold)
 
         self._target_samples = int(self.target_chunk_seconds * self.sample_rate)
         self._max_samples = (
@@ -190,6 +275,7 @@ class AudioChunker:
         self._total_samples = 0
         self._silent_samples_tail = 0
         self._has_speech = False
+        self._vad_in_speech = False
         self._has_new_speech_since_cut = False
         self._next_chunk_has_overlap = False
         self.last_emit_had_overlap = False
@@ -232,6 +318,7 @@ class AudioChunker:
         self._total_samples = 0
         self._silent_samples_tail = 0
         self._has_speech = False
+        self._vad_in_speech = False
         self._has_new_speech_since_cut = False
         self._next_chunk_has_overlap = False
         self._last_speech_time = None
@@ -251,7 +338,20 @@ class AudioChunker:
         self._buffer.append(arr)
         self._total_samples += arr.size
 
-        if rms >= self.silence_threshold:
+        vad_prob = -1.0
+        if self._vad_fn is not None:
+            vad_prob = 0.0 if rms < 1e-4 else float(self._vad_fn(arr))
+
+        if vad_prob >= 0.0:
+            thresh = self._vad_release_threshold if self._vad_in_speech else self._vad_threshold
+            is_speech = vad_prob >= thresh
+            self._vad_in_speech = is_speech
+            is_pause_valley = (not is_speech) or (vad_prob < self._vad_release_threshold)
+        else:
+            is_speech = rms >= self.silence_threshold
+            is_pause_valley = rms < self.silence_threshold * 1.4
+
+        if is_speech:
             self._has_speech = True
             self._has_new_speech_since_cut = True
             self._silent_samples_tail = 0
@@ -266,7 +366,7 @@ class AudioChunker:
 
         soft_cut = (
             self._total_samples >= self._target_samples
-            and (rms < self.silence_threshold * 1.4 or self._total_samples >= self._max_samples)
+            and (is_pause_valley or self._total_samples >= self._max_samples)
         )
         if soft_cut:
             emitted = self._concat_buffer()
@@ -278,18 +378,24 @@ class AudioChunker:
                 self._buffer = [tail]
                 self._total_samples = tail.size
                 if self._max_samples > self._target_samples:
-                    tail_rms = self._block_rms(tail)
-                    if tail_rms >= self.silence_threshold * 0.85:
+                    tail_active = (
+                        is_speech
+                        if vad_prob >= 0.0
+                        else (self._block_rms(tail) >= self.silence_threshold * 0.85)
+                    )
+                    if tail_active:
                         self._has_speech = True
                         self._has_new_speech_since_cut = False
                         self._next_chunk_has_overlap = True
                         self._last_speech_time = now
                     else:
                         self._has_speech = False
+                        self._vad_in_speech = False
                         self._next_chunk_has_overlap = False
                         self._last_speech_time = None
                 else:
                     self._has_speech = False
+                    self._vad_in_speech = False
                     self._next_chunk_has_overlap = True
                     self._last_speech_time = None
             else:
@@ -329,6 +435,15 @@ class AudioChunker:
         self._clear()
         return emitted
 
+    @property
+    def has_pending_speech(self) -> bool:
+        """Return True when the buffer currently holds enough un-emitted speech to flush."""
+        return bool(
+            self._has_speech
+            and self._has_new_speech_since_cut
+            and self._total_samples >= self._min_flush_samples
+        )
+
     def flush(self) -> np.ndarray | None:
         """Flush any remaining buffered speech on capture stop."""
         if (
@@ -352,7 +467,7 @@ class WasapiLoopbackCapturer:
         device_index: int | None = None,
         chunk_seconds: float = 4.0,
         overlap_seconds: float = 0.5,
-        silence_seconds: float = 0.8,
+        silence_seconds: float = 0.5,
         silence_threshold: float = 0.008,
     ) -> None:
         self.device_index = device_index
@@ -361,6 +476,12 @@ class WasapiLoopbackCapturer:
         self.silence_seconds = silence_seconds
         self.silence_threshold = silence_threshold
         self._resolved_device_name: str | None = None
+        self._has_pending_flag = threading.Event()
+
+    @property
+    def has_pending_speech(self) -> bool:
+        """Return True while buffered un-emitted speech is waiting in the active chunker."""
+        return self._has_pending_flag.is_set()
 
     def _resolve_device(self, p: pyaudio.PyAudio) -> dict:
         if self._resolved_device_name:
@@ -425,10 +546,15 @@ class WasapiLoopbackCapturer:
         on_status: Callable[[str], None] | None = None,
         max_reconnects: int = 3,
         on_chunk_meta: Callable[[np.ndarray, bool], None] | None = None,
+        on_raw_16k: Callable[[np.ndarray], None] | None = None,
+        flush_event: threading.Event | None = None,
+        on_flushed: Callable[[bool], None] | None = None,
     ) -> None:
         """Run capture loop with bounded WASAPI auto-reconnect until stop_event is set."""
-        if on_chunk is None and on_chunk_meta is None:
-            raise ValueError("Either on_chunk or on_chunk_meta callback must be provided")
+        if on_chunk is None and on_chunk_meta is None and on_raw_16k is None:
+            raise ValueError("One of on_chunk, on_chunk_meta, or on_raw_16k callback must be provided")
+
+        raw_stream_mode = on_raw_16k is not None and on_chunk is None and on_chunk_meta is None
 
         def _emit_chunk(raw_mono: np.ndarray, src_rate: int, had_overlap: bool) -> None:
             chunk_16k = resample_to_16k_mono(raw_mono, src_rate=src_rate, channels=1)
@@ -475,14 +601,34 @@ class WasapiLoopbackCapturer:
                 dev_index = int(device_info["index"])
                 channels = max(1, int(device_info.get("maxInputChannels", 2) or 2))
                 src_rate = max(8000, int(device_info.get("defaultSampleRate", 48000) or 48000))
-                chunker = AudioChunker(
-                    target_chunk_seconds=self.chunk_seconds,
-                    overlap_seconds=self.overlap_seconds,
-                    silence_seconds=self.silence_seconds,
-                    silence_threshold=self.silence_threshold,
-                    sample_rate=src_rate,
-                    max_chunk_seconds=self.chunk_seconds + 1.5,
-                )
+                if not raw_stream_mode:
+                    silero_vad = StreamingSileroVAD()
+                    vad_scorer: Callable[[np.ndarray], float] | None = None
+                    if silero_vad.available:
+
+                        def _score_vad(
+                            raw_mono: np.ndarray,
+                            _vad: StreamingSileroVAD = silero_vad,
+                            _rate: int = src_rate,
+                        ) -> float:
+                            block_16k = resample_to_16k_mono(raw_mono, src_rate=_rate, channels=1)
+                            return _vad.score_block(block_16k)
+
+                        vad_scorer = _score_vad
+                    max_utterance_sec = (
+                        min(14.0, max(self.chunk_seconds + 4.0, 10.0))
+                        if vad_scorer is not None
+                        else self.chunk_seconds + 1.5
+                    )
+                    chunker = AudioChunker(
+                        target_chunk_seconds=self.chunk_seconds,
+                        overlap_seconds=self.overlap_seconds,
+                        silence_seconds=self.silence_seconds,
+                        silence_threshold=self.silence_threshold,
+                        sample_rate=src_rate,
+                        max_chunk_seconds=max_utterance_sec,
+                        vad_fn=vad_scorer,
+                    )
                 frames_per_buffer = max(512, int(src_rate * 0.05))  # ~50 ms blocks
                 format_box = [pyaudio.paFloat32]
                 callback = _make_stream_callback(raw_queue, format_box)
@@ -510,25 +656,54 @@ class WasapiLoopbackCapturer:
                     )
 
                 logger.info(
-                    "WASAPI loopback started: %s (idx=%d, rate=%d, ch=%d, fmt=%s)",
+                    "WASAPI loopback started: %s (idx=%d, rate=%d, ch=%d, fmt=%s, mode=%s)",
                     device_info.get("name", "unknown"),
                     dev_index,
                     src_rate,
                     channels,
                     "float32" if format_box[0] == pyaudio.paFloat32 else "int16",
+                    "raw16k" if raw_stream_mode else "vad_chunker",
                 )
                 stream.start_stream()
 
                 last_level_emit = 0.0
                 last_active_check = time.monotonic()
+
+                def _sync_pending(_chunker: AudioChunker | None = chunker) -> None:
+                    if _chunker is not None and _chunker.has_pending_speech:
+                        self._has_pending_flag.set()
+                    else:
+                        self._has_pending_flag.clear()
+
+                def _handle_flush(
+                    _chunker: AudioChunker | None = chunker,
+                    _rate: int = src_rate,
+                ) -> None:
+                    if flush_event is None or not flush_event.is_set():
+                        return
+                    flush_event.clear()
+                    flushed: np.ndarray | None = None
+                    had_ov = False
+                    if _chunker is not None:
+                        flushed = _chunker.flush()
+                        had_ov = _chunker.last_emit_had_overlap
+                    _sync_pending(_chunker)
+                    if flushed is not None:
+                        _emit_chunk(flushed, _rate, had_ov)
+                    if on_flushed is not None:
+                        on_flushed(flushed is not None)
+
                 while not stop_event.is_set():
                     try:
-                        raw_bytes, fmt = raw_queue.get(timeout=0.1)
+                        raw_bytes, fmt = raw_queue.get(timeout=0.04)
                     except queue.Empty:
+                        _handle_flush()
                         now = time.monotonic()
-                        ready = chunker.poll_silence(now)
-                        if ready is not None:
-                            _emit_chunk(ready, src_rate, chunker.last_emit_had_overlap)
+                        if chunker is not None:
+                            ready = chunker.poll_silence(now)
+                            _sync_pending()
+                            if ready is not None:
+                                _emit_chunk(ready, src_rate, chunker.last_emit_had_overlap)
                         if on_level is not None and (now - last_level_emit) >= 0.1:
                             on_level(0.0)
                             last_level_emit = now
@@ -541,16 +716,28 @@ class WasapiLoopbackCapturer:
                     reconnect_attempts = 0
                     mono_src = _bytes_to_mono_float32(raw_bytes, fmt, channels)
                     now = time.monotonic()
-                    ready, rms = chunker.feed(mono_src, now)
-                    if ready is not None:
-                        _emit_chunk(ready, src_rate, chunker.last_emit_had_overlap)
+                    if raw_stream_mode:
+                        rms = AudioChunker._block_rms(mono_src)
+                        if on_raw_16k is not None and mono_src.size > 0:
+                            block_16k = resample_to_16k_mono(mono_src, src_rate=src_rate, channels=1)
+                            if block_16k.size > 0:
+                                on_raw_16k(block_16k)
+                    else:
+                        assert chunker is not None
+                        ready, rms = chunker.feed(mono_src, now)
+                        if ready is not None:
+                            _emit_chunk(ready, src_rate, chunker.last_emit_had_overlap)
+                        _sync_pending()
+                    _handle_flush()
                     if on_level is not None and (now - last_level_emit) >= 0.08:
                         on_level(rms)
                         last_level_emit = now
 
-                final_chunk = chunker.flush()
-                if final_chunk is not None:
-                    _emit_chunk(final_chunk, src_rate, chunker.last_emit_had_overlap)
+                if chunker is not None:
+                    final_chunk = chunker.flush()
+                    _sync_pending()
+                    if final_chunk is not None:
+                        _emit_chunk(final_chunk, src_rate, chunker.last_emit_had_overlap)
                 break
             except (OSError, LookupError, ValueError, KeyError) as exc:
                 if stop_event.is_set():
@@ -575,6 +762,7 @@ class WasapiLoopbackCapturer:
                     on_status(f"Аудіопристрій змінився — перепідключення ({reconnect_attempts}/{max_reconnects})...")
                 stop_event.wait(0.8)
             finally:
+                self._has_pending_flag.clear()
                 self._close_stream_quietly(stream, p)
                 if p is not None:
                     with _PYAUDIO_LOCK:

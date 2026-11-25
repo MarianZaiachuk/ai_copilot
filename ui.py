@@ -361,10 +361,19 @@ QPushButton#StealthButton {
     font-size: 11px;
     font-weight: 600;
 }
-QPushButton#StealthButton:checked {
+QPushButton#StealthButton[stealth="on"],
+QPushButton#StealthButton[stealth="on"]:hover,
+QPushButton#StealthButton[stealth="on"]:pressed {
     background-color: #15352A;
     border-color: #2D8A66;
     color: #7BF0BE;
+}
+QPushButton#StealthButton[stealth="off"],
+QPushButton#StealthButton[stealth="off"]:hover,
+QPushButton#StealthButton[stealth="off"]:pressed {
+    background-color: #451A1A;
+    border-color: #DC2626;
+    color: #FCA5A5;
 }
 QPushButton#WebSearchButton {
     padding: 2px 4px;
@@ -521,6 +530,25 @@ QSlider::handle:horizontal {
 """ + DARK_SCROLLBAR_QSS
 
 
+def get_window_display_affinity(hwnd: int) -> int | None:
+    """Query current Windows DWM display affinity for a top-level HWND."""
+    if sys.platform != "win32" or hwnd <= 0:
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        get_fn = getattr(user32, "GetWindowDisplayAffinity", None)
+        if get_fn is None:
+            return None
+        get_fn.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        get_fn.restype = wintypes.BOOL
+        actual = wintypes.DWORD(0)
+        if not bool(get_fn(wintypes.HWND(hwnd), ctypes.byref(actual))):
+            return None
+        return int(actual.value)
+    except Exception:
+        return None
+
+
 def apply_window_display_affinity(hwnd: int, exclude_from_capture: bool) -> bool:
     """Toggle Windows WDA_EXCLUDEFROMCAPTURE on a top-level HWND and verify via DWM."""
     if sys.platform != "win32" or hwnd <= 0:
@@ -613,6 +641,10 @@ class CopilotOverlayWindow(QWidget):
         self._copy_reset_timer.setSingleShot(True)
         self._copy_reset_timer.setInterval(1200)
         self._copy_reset_timer.timeout.connect(self._reset_copy_button_icon)
+
+        self._stealth_guard_timer = QTimer(self)
+        self._stealth_guard_timer.setInterval(2000)
+        self._stealth_guard_timer.timeout.connect(self._verify_stealth_affinity)
 
         self.setWindowTitle("AI Copilot — Оверлей")
         if app_icon is not None and not app_icon.isNull():
@@ -716,12 +748,12 @@ class CopilotOverlayWindow(QWidget):
 
         self._stealth_btn = QPushButton("◈ Stealth", self._title_bar)
         self._stealth_btn.setObjectName("StealthButton")
-        self._stealth_btn.setCheckable(True)
-        self._stealth_btn.setChecked(self._stealth_enabled)
+        self._stealth_btn.setCheckable(False)
+        self._stealth_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._stealth_btn.setProperty("stealth", "on" if self._stealth_enabled else "off")
         self._stealth_btn.setToolTip(
-            "Stealth-режим: приховує оверлей при демонстрації екрана (Zoom/Discord/OBS)"
+            "Stealth-режим завжди активний (невидимий на Zoom/Discord/OBS). Вимкнення — лише в Налаштуваннях → Оверлей."
         )
-        self._stealth_btn.toggled.connect(self._on_stealth_btn_toggled)
         self._title_layout.addWidget(self._stealth_btn)
 
         self._web_search_btn = QPushButton("🌐 Веб", self._title_bar)
@@ -1038,7 +1070,7 @@ class CopilotOverlayWindow(QWidget):
             self._title_layout.setSpacing(5)
             self._expand_btn.setText("▭")
             self._expand_btn.setToolTip("Згорнути в компактний режим")
-            self._stealth_btn.setText("Stealth: ON" if self._stealth_enabled else "Stealth: OFF")
+            self._stealth_btn.setText("Stealth: ON" if self._stealth_enabled else "⚠ Stealth: OFF")
             self.manual_input.setPlaceholderText(
                 "Додаткове питання або уточнення (Enter для надсилання)..."
             )
@@ -1050,7 +1082,7 @@ class CopilotOverlayWindow(QWidget):
             self._title_layout.setSpacing(3)
             self._expand_btn.setText("⤢")
             self._expand_btn.setToolTip("Розгорнути повний інтерфейс")
-            self._stealth_btn.setText("◈ Stealth" if self._stealth_enabled else "◈ Викл.")
+            self._stealth_btn.setText("◈ Stealth" if self._stealth_enabled else "⚠ Викл.")
             self.manual_input.setPlaceholderText("Введіть питання (Enter)...")
             self.setMinimumSize(420, 260)
             self.resize(self._compact_size)
@@ -1130,26 +1162,45 @@ class CopilotOverlayWindow(QWidget):
         if self.isVisible():
             self.set_stealth_mode(self._stealth_enabled)
 
+    def _verify_stealth_affinity(self) -> None:
+        if not self._stealth_enabled or not self.isVisible():
+            return
+        hwnd = int(self.winId()) if self.winId() else 0
+        if hwnd <= 0:
+            return
+        actual = get_window_display_affinity(hwnd)
+        if actual is None or actual != WDA_EXCLUDEFROMCAPTURE:
+            self.set_stealth_mode(True)
+
     def showEvent(self, event) -> None:  # type: ignore[override]
         super().showEvent(event)
         self.clamp_to_available_screen()
         self.set_stealth_mode(self._stealth_enabled)
+        if self._stealth_enabled:
+            self._stealth_guard_timer.start()
         QTimer.singleShot(0, self._reapply_stealth_if_visible)
         self.visibility_changed.emit(True)
 
     def changeEvent(self, event: QEvent) -> None:  # type: ignore[override]
         super().changeEvent(event)
-        if event.type() in (
+        watched = {
             QEvent.Type.WindowStateChange,
             QEvent.Type.ActivationChange,
-        ) and self.isVisible():
+            QEvent.Type.WinIdChange,
+        }
+        screen_ev = getattr(QEvent.Type, "ScreenChangeInternal", None)
+        if screen_ev is not None:
+            watched.add(screen_ev)
+        if event.type() in watched and self.isVisible():
             QTimer.singleShot(0, self._reapply_stealth_if_visible)
 
     def hideEvent(self, event) -> None:  # type: ignore[override]
+        self._stealth_guard_timer.stop()
         super().hideEvent(event)
         self.visibility_changed.emit(False)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._stealth_guard_timer.stop()
         self._render_timer.stop()
         self._copy_reset_timer.stop()
         self.closing.emit()
@@ -1295,26 +1346,35 @@ class CopilotOverlayWindow(QWidget):
 
     # --- Public state & UI callbacks ---
 
-    def _on_stealth_btn_toggled(self, checked: bool) -> None:
-        self.set_stealth_mode(checked)
-        self.stealth_toggled.emit(self._stealth_enabled)
-
     def set_stealth_mode(self, enabled: bool) -> bool:
         """Apply or remove Windows WDA_EXCLUDEFROMCAPTURE on this overlay window."""
         self._stealth_enabled = bool(enabled)
-        if self._stealth_btn.isChecked() != self._stealth_enabled:
-            self._stealth_btn.blockSignals(True)
-            self._stealth_btn.setChecked(self._stealth_enabled)
-            self._stealth_btn.blockSignals(False)
+        self._stealth_btn.setProperty("stealth", "on" if self._stealth_enabled else "off")
+        self._stealth_btn.style().unpolish(self._stealth_btn)
+        self._stealth_btn.style().polish(self._stealth_btn)
 
         if self._expanded:
-            self._stealth_btn.setText("Stealth: ON" if self._stealth_enabled else "Stealth: OFF")
+            self._stealth_btn.setText("Stealth: ON" if self._stealth_enabled else "⚠ Stealth: OFF")
         else:
-            self._stealth_btn.setText("◈ Stealth" if self._stealth_enabled else "◈ Викл.")
+            self._stealth_btn.setText("◈ Stealth" if self._stealth_enabled else "⚠ Викл.")
+
+        if self._stealth_enabled:
+            self._stealth_btn.setToolTip(
+                "Stealth-режим завжди активний (невидимий на Zoom/Discord/OBS). Вимкнення — лише в Налаштуваннях → Оверлей."
+            )
+        else:
+            self._stealth_btn.setToolTip(
+                "УВАГА: Stealth-режим вимкнено в Налаштуваннях! Вікно видиме при демонстрації екрана."
+            )
 
         hwnd = int(self.winId()) if self.winId() else 0
         ok = apply_window_display_affinity(hwnd, self._stealth_enabled)
         self._stealth_applied = ok
+        if self._stealth_enabled and self.isVisible():
+            if not self._stealth_guard_timer.isActive():
+                self._stealth_guard_timer.start()
+        else:
+            self._stealth_guard_timer.stop()
         return ok
 
     def _refresh_web_btn_label(self) -> None:

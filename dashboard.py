@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -39,20 +40,30 @@ from PyQt6.QtWidgets import (
 )
 
 from audio_capture import AudioDeviceInfo
-from config import AppConfig, DEFAULT_SYSTEM_PROMPT, has_valid_llm_credentials
+from config import (
+    AppConfig,
+    DEFAULT_SYSTEM_PROMPT,
+    PromptProfile,
+    get_provider_api_key,
+    get_provider_model,
+    has_valid_llm_credentials,
+)
 from context_loader import LoadedDocument, build_file_dialog_filter
 from llm_client import ApiKeyCheckResult, get_deprecated_model_replacement
 from ui import (
     DARK_SCROLLBAR_QSS,
+    WDA_EXCLUDEFROMCAPTURE,
     ElidedLabel,
     apply_window_display_affinity,
     configure_markdown_browser,
+    get_window_display_affinity,
     set_browser_markdown_sticky,
 )
 
 PROVIDER_CHOICES: list[tuple[str, str]] = [
     ("openai", "OpenAI (GPT-6 Luna / Sol / Astra)"),
     ("groq", "Groq (Qwen 3.8 / GPT-OSS / Llama)"),
+    ("cerebras", "Cerebras (Qwen 3.8 / GPT-OSS — надшвидкий)"),
     ("gemini", "Google Gemini (Gemini 3.8 Flash / Gemini 4)"),
     ("ollama", "Ollama (локально на ПК, без ключа)"),
     ("lmstudio", "LM Studio (локально на ПК, без ключа)"),
@@ -67,6 +78,10 @@ MODEL_PRESETS: dict[str, list[str]] = {
         "groq/compound-mini",
         "groq/compound",
         "llama-3.1-8b-instant",
+    ],
+    "cerebras": [
+        "qwen-3.8-27b",
+        "gpt-oss-120b",
     ],
     "gemini": [
         "gemini-3.8-flash",
@@ -83,12 +98,49 @@ MODEL_PRESETS: dict[str, list[str]] = {
 BASE_URL_PLACEHOLDERS: dict[str, str] = {
     "openai": "https://api.openai.com/v1 (стандартно)",
     "groq": "https://api.groq.com/openai/v1",
+    "cerebras": "https://api.cerebras.ai/v1",
     "ollama": "http://localhost:11434/v1",
     "lmstudio": "http://localhost:1234/v1",
     "gemini": "Не використовується для Gemini",
 }
 
+STT_PROVIDER_CHOICES: list[tuple[str, str]] = [
+    ("local", "Локальний Whisper (faster-whisper на GPU/CPU — безкоштовно)"),
+    ("deepgram", "Deepgram Nova-3 (хмарний real-time WebSocket — макс. швидкість + якість)"),
+    ("elevenlabs", "ElevenLabs Scribe (хмарний — найвища точність української ~3% WER)"),
+    ("groq", "Groq Cloud Whisper (хмарний — працює з вашим Groq API-ключем, 0 VRAM)"),
+]
+
+STT_MODEL_PRESETS: dict[str, list[str]] = {
+    "deepgram": ["nova-3", "nova-2"],
+    "elevenlabs": ["scribe_v3", "scribe_v2", "scribe_v1"],
+    "groq": ["whisper-large-v3", "whisper-large-v3-turbo"],
+}
+
+STT_PROVIDER_HINTS: dict[str, str] = {
+    "local": (
+        "Працює локально з нейромережевим Silero VAD (ріже репліки за реальними паузами). "
+        "Для кращої української оберіть whisper-large-v3-turbo-uk або large-v3."
+    ),
+    "deepgram": (
+        "Потоковий real-time WebSocket (wss://api.deepgram.com). Миттєво транскрибує під час мови "
+        "з пунктуацією і підтримкою термінів словника (nova-3)."
+    ),
+    "elevenlabs": (
+        "Найнижчий рівень помилок для української (~3–5% WER, модель scribe_v3 + keyterms). "
+        "Автоматично підхоплює ELEVENLABS_API_KEY із .env, якщо поле ключа порожнє."
+    ),
+    "groq": (
+        "Виконує whisper-large-v3 у хмарі Groq за ~0.3 с без навантаження на GPU. "
+        "Ключ STT можна лишити порожнім — підхопиться ваш Groq API-ключ зі вкладки ШІ."
+    ),
+}
+
 WHISPER_MODEL_CHOICES: list[tuple[str, str]] = [
+    (
+        "skypro1111/whisper-large-v3-turbo-ukrainian-ukraine-3percent-ct2",
+        "whisper-large-v3-turbo-uk (fine-tuned UA — топ локальна для української, ~1.6 ГБ)",
+    ),
     ("large-v3-turbo", "large-v3-turbo — швидка й якісна для української (рекомендовано)"),
     ("large-v3", "large-v3 — максимальна точність української (32-шаровий декодер, ~3 ГБ VRAM)"),
     ("medium", "medium — збалансована швидкість і якість (~1.5 ГБ)"),
@@ -98,8 +150,17 @@ WHISPER_MODEL_CHOICES: list[tuple[str, str]] = [
 
 WHISPER_LANG_CHOICES: list[tuple[str, str]] = [
     ("uk", "Українська (примусово uk — найкраща стабільність)"),
+    ("en+uk", "Змішана EN + UA (розмовна англійська + українська)"),
     ("auto", "Автовизначення мови (auto)"),
     ("en", "English (en)"),
+]
+
+PROFILE_LANG_CHOICES: list[tuple[str, str]] = [
+    ("uk", "Українська (uk)"),
+    ("en+uk", "Змішана EN + UA (розмовна англійська)"),
+    ("en", "English (en)"),
+    ("auto", "Автовизначення (auto)"),
+    ("", "Не змінювати мову STT"),
 ]
 
 DASHBOARD_QSS = """
@@ -390,8 +451,14 @@ class DashboardWindow(QWidget):
     settings_saved = pyqtSignal(object)
     test_llm_requested = pyqtSignal(object)
     fetch_models_requested = pyqtSignal(object)
+    test_stt_requested = pyqtSignal(object)
     test_web_search_requested = pyqtSignal(object)
     test_screen_capture_requested = pyqtSignal(int, int)
+    profile_selected = pyqtSignal(str)
+    profile_create_requested = pyqtSignal(str)
+    profile_rename_requested = pyqtSignal(str, str)
+    profile_delete_requested = pyqtSignal(str)
+    profile_language_changed = pyqtSignal(str, str)
     quit_requested = pyqtSignal()
     minimized_to_tray = pyqtSignal()
 
@@ -406,6 +473,9 @@ class DashboardWindow(QWidget):
         self._config = replace(config)
         self._active_provider = str(config.llm_provider or "openai")
         self._last_check_result: ApiKeyCheckResult | None = None
+        self._pending_settings_verify = False
+        self._draft_keys: dict[str, str] = {}
+        self._draft_models: dict[str, str] = {}
         self._is_capturing = False
         self._is_generating = False
         self._allow_close = False
@@ -420,6 +490,10 @@ class DashboardWindow(QWidget):
         self._copy_reset_timer.setSingleShot(True)
         self._copy_reset_timer.setInterval(1200)
         self._copy_reset_timer.timeout.connect(self._reset_live_copy_btn)
+
+        self._stealth_guard_timer = QTimer(self)
+        self._stealth_guard_timer.setInterval(2000)
+        self._stealth_guard_timer.timeout.connect(self._verify_dashboard_stealth_affinity)
 
         self.setWindowTitle("AI Copilot • Панель керування")
         if app_icon is not None and not app_icon.isNull():
@@ -461,11 +535,44 @@ class DashboardWindow(QWidget):
         self._allow_close = True
         self.close()
 
+    def _auto_save_settings_if_valid(self) -> None:
+        if self._allow_close:
+            return
+        candidate = self._collect_config_from_ui()
+        if candidate == self._config:
+            return
+        if self._validate_hotkey_pair(candidate.hotkey_answer, candidate.hotkey_toggle) is not None:
+            return
+        if candidate.llm_provider == self._config.llm_provider or has_valid_llm_credentials(
+            candidate
+        ):
+            self._on_save_settings_clicked()
+
+    def _on_quit_clicked(self) -> None:
+        if self._stack.currentIndex() == 3:
+            self._auto_save_settings_if_valid()
+        self.quit_requested.emit()
+
     def _apply_dashboard_stealth(self) -> bool:
         hwnd = int(self.winId()) if self.winId() else 0
         ok = apply_window_display_affinity(hwnd, self._config.dashboard_stealth)
         self._stealth_applied = ok
+        if self._config.dashboard_stealth and self.isVisible():
+            if not self._stealth_guard_timer.isActive():
+                self._stealth_guard_timer.start()
+        else:
+            self._stealth_guard_timer.stop()
         return ok
+
+    def _verify_dashboard_stealth_affinity(self) -> None:
+        if not self._config.dashboard_stealth or not self.isVisible():
+            return
+        hwnd = int(self.winId()) if self.winId() else 0
+        if hwnd <= 0:
+            return
+        actual = get_window_display_affinity(hwnd)
+        if actual is None or actual != WDA_EXCLUDEFROMCAPTURE:
+            self._apply_dashboard_stealth()
 
     def _reapply_stealth_if_visible(self) -> None:
         if self.isVisible():
@@ -478,18 +585,31 @@ class DashboardWindow(QWidget):
 
     def changeEvent(self, event: QEvent) -> None:  # type: ignore[override]
         super().changeEvent(event)
-        if event.type() in (
+        watched = {
             QEvent.Type.WindowStateChange,
             QEvent.Type.ActivationChange,
-        ) and self.isVisible():
+            QEvent.Type.WinIdChange,
+        }
+        screen_ev = getattr(QEvent.Type, "ScreenChangeInternal", None)
+        if screen_ev is not None:
+            watched.add(screen_ev)
+        if event.type() in watched and self.isVisible():
             QTimer.singleShot(0, self._reapply_stealth_if_visible)
 
+    def hideEvent(self, event) -> None:  # type: ignore[override]
+        self._stealth_guard_timer.stop()
+        super().hideEvent(event)
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        if not self._allow_close and self._stack.currentIndex() == 3:
+            self._auto_save_settings_if_valid()
         if not self._allow_close and self._hide_to_tray:
             event.ignore()
+            self._stealth_guard_timer.stop()
             self.hide()
             self.minimized_to_tray.emit()
             return
+        self._stealth_guard_timer.stop()
         self._copy_reset_timer.stop()
         if not self._allow_close:
             self.quit_requested.emit()
@@ -561,7 +681,7 @@ class DashboardWindow(QWidget):
 
         self._sb_quit_btn = QPushButton("Вихід", sidebar)
         self._sb_quit_btn.setObjectName("DangerBtn")
-        self._sb_quit_btn.clicked.connect(self.quit_requested.emit)
+        self._sb_quit_btn.clicked.connect(self._on_quit_clicked)
         sb_layout.addWidget(self._sb_quit_btn)
 
         ver_lbl = QLabel("v2.0 • Stealth + CUDA", sidebar)
@@ -580,6 +700,8 @@ class DashboardWindow(QWidget):
         root_layout.addWidget(self._stack, 1)
 
     def _switch_page(self, index: int) -> None:
+        if self._stack.currentIndex() == 3 and index != 3:
+            self._auto_save_settings_if_valid()
         self._stack.setCurrentIndex(index)
         if 0 <= index < len(self._nav_buttons):
             self._nav_buttons[index].setChecked(True)
@@ -950,6 +1072,54 @@ class DashboardWindow(QWidget):
         title.setObjectName("PageHeader")
         layout.addWidget(title)
 
+        prof_card = self._make_card(page)
+        prof_l = QVBoxLayout(prof_card)
+        prof_l.setContentsMargins(12, 8, 12, 8)
+        prof_l.setSpacing(6)
+
+        prof_row = QHBoxLayout()
+        prof_row.setSpacing(6)
+        prof_lbl = QLabel("Профіль:", prof_card)
+        prof_lbl.setObjectName("MutedText")
+        prof_row.addWidget(prof_lbl)
+
+        self.profile_combo = QComboBox(prof_card)
+        self.profile_combo.setMinimumWidth(160)
+        self.profile_combo.currentIndexChanged.connect(self._on_profile_combo_changed)
+        prof_row.addWidget(self.profile_combo, 1)
+
+        self._new_profile_btn = QPushButton("+ Новий", prof_card)
+        self._new_profile_btn.setToolTip("Створити новий профіль предмета")
+        self._new_profile_btn.clicked.connect(self._on_new_profile_clicked)
+        prof_row.addWidget(self._new_profile_btn)
+
+        self._rename_profile_btn = QPushButton("✎ Перейменувати", prof_card)
+        self._rename_profile_btn.setToolTip("Змінити назву активного профілю")
+        self._rename_profile_btn.clicked.connect(self._on_rename_profile_clicked)
+        prof_row.addWidget(self._rename_profile_btn)
+
+        self._delete_profile_btn = QPushButton("✕", prof_card)
+        self._delete_profile_btn.setObjectName("DangerBtn")
+        self._delete_profile_btn.setToolTip("Видалити активний профіль")
+        self._delete_profile_btn.setFixedWidth(34)
+        self._delete_profile_btn.clicked.connect(self._on_delete_profile_clicked)
+        prof_row.addWidget(self._delete_profile_btn)
+        prof_l.addLayout(prof_row)
+
+        prof_lang_row = QHBoxLayout()
+        prof_lang_row.setSpacing(6)
+        prof_lang_lbl = QLabel("Мова STT:", prof_card)
+        prof_lang_lbl.setObjectName("MutedText")
+        prof_lang_row.addWidget(prof_lang_lbl)
+
+        self.profile_lang_combo = QComboBox(prof_card)
+        for code, label in PROFILE_LANG_CHOICES:
+            self.profile_lang_combo.addItem(label, code)
+        self.profile_lang_combo.currentIndexChanged.connect(self._on_profile_lang_changed)
+        prof_lang_row.addWidget(self.profile_lang_combo, 1)
+        prof_l.addLayout(prof_lang_row)
+        layout.addWidget(prof_card)
+
         hdr = QHBoxLayout()
         hdr.setSpacing(8)
 
@@ -1031,7 +1201,7 @@ class DashboardWindow(QWidget):
         prompt_l.addLayout(p_hdr)
 
         self.prompt_edit = QPlainTextEdit(prompt_card)
-        self.prompt_edit.setFixedHeight(96)
+        self.prompt_edit.setFixedHeight(84)
         prompt_l.addWidget(self.prompt_edit)
 
         layout.addWidget(prompt_card)
@@ -1095,8 +1265,6 @@ class DashboardWindow(QWidget):
         self._toggle_key_btn.toggled.connect(self._on_toggle_api_key_visibility)
         key_row.addWidget(self._toggle_key_btn)
         self._verify_key_btn = QPushButton("✓ Перевірити ключ", tab)
-        self._verify_key_btn.setObjectName("PrimaryCTA")
-        self._verify_key_btn.setStyleSheet("padding: 6px 12px;")
         self._verify_key_btn.setToolTip("Перевірити дійсність API-ключа та активність обраної моделі")
         self._verify_key_btn.clicked.connect(self._on_test_connection_clicked)
         key_row.addWidget(self._verify_key_btn)
@@ -1163,6 +1331,42 @@ class DashboardWindow(QWidget):
         form = QFormLayout(tab)
         form.setContentsMargins(16, 16, 16, 16)
         form.setSpacing(12)
+        self._speech_form = form
+
+        self._stt_provider_combo = QComboBox(tab)
+        for code, label in STT_PROVIDER_CHOICES:
+            self._stt_provider_combo.addItem(label, code)
+        self._stt_provider_combo.currentIndexChanged.connect(self._on_stt_provider_changed)
+        form.addRow("Рушій розпізнавання (STT):", self._stt_provider_combo)
+
+        self._stt_hint_lbl = QLabel("", tab)
+        self._stt_hint_lbl.setObjectName("MutedText")
+        self._stt_hint_lbl.setWordWrap(True)
+        form.addRow("", self._stt_hint_lbl)
+
+        self._stt_model_combo = QComboBox(tab)
+        self._stt_model_combo.setEditable(True)
+        form.addRow("Модель хмарного STT:", self._stt_model_combo)
+
+        stt_key_row = QHBoxLayout()
+        self._stt_api_key_edit = QLineEdit(tab)
+        self._stt_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        stt_key_row.addWidget(self._stt_api_key_edit, 1)
+        self._toggle_stt_key_btn = QPushButton("Показати", tab)
+        self._toggle_stt_key_btn.setCheckable(True)
+        self._toggle_stt_key_btn.toggled.connect(self._on_toggle_stt_key_visibility)
+        stt_key_row.addWidget(self._toggle_stt_key_btn)
+        self._stt_key_row = stt_key_row
+        form.addRow("STT API-ключ:", stt_key_row)
+
+        stt_diag_row = QHBoxLayout()
+        self._test_stt_btn = QPushButton("Перевірити STT", tab)
+        self._test_stt_btn.clicked.connect(self._on_test_stt_clicked)
+        stt_diag_row.addWidget(self._test_stt_btn)
+        self._stt_test_lbl = QLabel("", tab)
+        self._stt_test_lbl.setWordWrap(True)
+        stt_diag_row.addWidget(self._stt_test_lbl, 1)
+        form.addRow("Діагностика STT:", stt_diag_row)
 
         self._whisper_model_combo = QComboBox(tab)
         for code, label in WHISPER_MODEL_CHOICES:
@@ -1214,9 +1418,9 @@ class DashboardWindow(QWidget):
         self._silence_thresh_spin.setSingleStep(0.001)
         self._silence_thresh_spin.setSuffix(" RMS")
         self._silence_thresh_spin.setToolTip(
-            "Поріг гучності мовлення (нижче цього рівня вважається тишею)"
+            "Резервний поріг гучності мовлення, коли Silero VAD вимкнений"
         )
-        form.addRow("Поріг тиші (VAD):", self._silence_thresh_spin)
+        form.addRow("Поріг тиші (RMS резерв):", self._silence_thresh_spin)
 
         self._rag_budget_spin = QSpinBox(tab)
         self._rag_budget_spin.setRange(2000, 40000)
@@ -1244,13 +1448,23 @@ class DashboardWindow(QWidget):
             "Stealth-режим оверлею (WDA_EXCLUDEFROMCAPTURE — невидимий при шарингу екрана)",
             tab,
         )
+        self._ov_stealth_chk.clicked.connect(self._on_ov_stealth_checkbox_clicked)
         form.addRow("Оверлей:", self._ov_stealth_chk)
 
         self._dash_stealth_chk = QCheckBox(
             "Stealth-режим панелі керування (також ховати головне вікно від запису екрана)",
             tab,
         )
+        self._dash_stealth_chk.clicked.connect(self._on_dash_stealth_checkbox_clicked)
         form.addRow("Панель:", self._dash_stealth_chk)
+
+        stealth_info = QLabel(
+            "Stealth-режим завжди увімкнений при запуску. Вимкнути його можна лише тут через підтвердження.",
+            tab,
+        )
+        stealth_info.setObjectName("MutedText")
+        stealth_info.setWordWrap(True)
+        form.addRow("", stealth_info)
 
         op_row = QHBoxLayout()
         self._ov_opacity_slider = QSlider(Qt.Orientation.Horizontal, tab)
@@ -1441,6 +1655,62 @@ class DashboardWindow(QWidget):
         )
         self._toggle_web_key_btn.setText("Сховати" if checked else "Показати")
 
+    def _on_toggle_stt_key_visibility(self, checked: bool) -> None:
+        self._stt_api_key_edit.setEchoMode(
+            QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+        )
+        self._toggle_stt_key_btn.setText("Сховати" if checked else "Показати")
+
+    def _on_stt_provider_changed(self, _idx: int, *, clear_text: bool = True) -> None:
+        prov = str(self._stt_provider_combo.currentData() or "local").lower()
+        is_local = prov == "local"
+        is_deepgram = prov == "deepgram"
+
+        self._stt_hint_lbl.setText(STT_PROVIDER_HINTS.get(prov, ""))
+        self._speech_form.setRowVisible(self._stt_model_combo, not is_local)
+        self._speech_form.setRowVisible(self._stt_key_row, not is_local)
+        self._speech_form.setRowVisible(self._whisper_model_combo, is_local)
+        self._speech_form.setRowVisible(self._whisper_device_combo, is_local)
+        self._speech_form.setRowVisible(self._whisper_compute_combo, is_local)
+        self._speech_form.setRowVisible(self._beam_size_spin, is_local)
+        self._speech_form.setRowVisible(self._chunk_sec_spin, not is_deepgram)
+        self._speech_form.setRowVisible(self._silence_thresh_spin, not is_deepgram)
+
+        if not is_local:
+            presets = STT_MODEL_PRESETS.get(prov, [])
+            cur = self._stt_model_combo.currentText().strip()
+            self._stt_model_combo.blockSignals(True)
+            self._stt_model_combo.clear()
+            for m in presets:
+                self._stt_model_combo.addItem(m)
+            if not clear_text and cur:
+                self._stt_model_combo.setCurrentText(cur)
+            elif presets:
+                self._stt_model_combo.setCurrentIndex(0)
+            self._stt_model_combo.blockSignals(False)
+
+            placeholders = {
+                "deepgram": "Вставте Deepgram API Key...",
+                "elevenlabs": "Опційно: порожньо = ELEVENLABS_API_KEY із .env",
+                "groq": "Опційно: порожньо = Groq API-ключ зі вкладки ШІ",
+            }
+            self._stt_api_key_edit.setPlaceholderText(placeholders.get(prov, "Вставте STT API-ключ..."))
+
+        self._stt_test_lbl.setText("")
+
+    def _on_test_stt_clicked(self) -> None:
+        temp_cfg = self._collect_config_from_ui()
+        self._test_stt_btn.setEnabled(False)
+        self._stt_test_lbl.setStyleSheet("color: #93A2B8;")
+        self._stt_test_lbl.setText("Перевіряю STT...")
+        self.test_stt_requested.emit(temp_cfg)
+
+    def set_stt_test_result(self, ok: bool, message: str) -> None:
+        self._test_stt_btn.setEnabled(True)
+        color = "#4ADE80" if ok else "#F87171"
+        self._stt_test_lbl.setStyleSheet(f"color: {color}; font-weight: 500;")
+        self._stt_test_lbl.setText(message)
+
     def _open_settings_tab(self, tab_idx: int) -> None:
         self._switch_page(3)
         self._settings_tabs.setCurrentIndex(tab_idx)
@@ -1448,6 +1718,8 @@ class DashboardWindow(QWidget):
     def _populate_settings_from_config(self, cfg: AppConfig) -> None:
         self._config = replace(cfg)
         self._active_provider = str(cfg.llm_provider or "openai")
+        self._draft_keys.clear()
+        self._draft_models.clear()
 
         p_idx = self._provider_combo.findData(cfg.llm_provider)
         self._provider_combo.blockSignals(True)
@@ -1455,7 +1727,7 @@ class DashboardWindow(QWidget):
         self._provider_combo.blockSignals(False)
         self._on_provider_changed(self._provider_combo.currentIndex(), clear_stale_base_url=False)
 
-        current_model = cfg.gemini_model if cfg.llm_provider == "gemini" else cfg.openai_model
+        current_model = get_provider_model(cfg, cfg.llm_provider)
         self._model_combo.blockSignals(True)
         self._model_combo.setCurrentText(current_model)
         self._model_combo.blockSignals(False)
@@ -1464,6 +1736,9 @@ class DashboardWindow(QWidget):
         self._temp_spin.setValue(cfg.llm_temperature)
         self._max_tokens_spin.setValue(cfg.llm_max_tokens)
 
+        self._select_combo_by_data(self._stt_provider_combo, cfg.stt_provider)
+        if cfg.whisper_model and self._whisper_model_combo.findData(cfg.whisper_model) < 0:
+            self._whisper_model_combo.addItem(cfg.whisper_model, cfg.whisper_model)
         self._select_combo_by_data(self._whisper_model_combo, cfg.whisper_model)
         self._select_combo_by_data(self._whisper_device_combo, cfg.whisper_device)
         self._select_combo_by_data(self._whisper_compute_combo, cfg.whisper_compute_type)
@@ -1474,9 +1749,17 @@ class DashboardWindow(QWidget):
         self._window_sec_spin.setValue(cfg.transcript_window_seconds)
         self._silence_thresh_spin.setValue(cfg.audio_silence_threshold)
         self._rag_budget_spin.setValue(cfg.rag_context_budget_chars)
+        self._stt_api_key_edit.setText(cfg.stt_api_key)
+        self._on_stt_provider_changed(self._stt_provider_combo.currentIndex(), clear_text=True)
+        if cfg.stt_model:
+            self._stt_model_combo.setCurrentText(cfg.stt_model)
 
+        self._ov_stealth_chk.blockSignals(True)
         self._ov_stealth_chk.setChecked(cfg.overlay_stealth)
+        self._ov_stealth_chk.blockSignals(False)
+        self._dash_stealth_chk.blockSignals(True)
         self._dash_stealth_chk.setChecked(cfg.dashboard_stealth)
+        self._dash_stealth_chk.blockSignals(False)
         self._ov_opacity_slider.setValue(cfg.overlay_opacity)
         self._ov_font_slider.setValue(int(round(cfg.overlay_font_scale * 100)))
         self._hk_answer_edit.setText(cfg.hotkey_answer)
@@ -1518,7 +1801,15 @@ class DashboardWindow(QWidget):
 
     def _on_provider_changed(self, _idx: int, *, clear_stale_base_url: bool = True) -> None:
         provider = str(self._provider_combo.currentData() or "openai")
-        provider_switched = provider != self._active_provider
+        prev_provider = self._active_provider
+        provider_switched = provider != prev_provider
+        if provider_switched and prev_provider:
+            if prev_provider not in {"ollama", "lmstudio"}:
+                self._draft_keys[prev_provider] = self._api_key_edit.text().strip()
+            prev_model_txt = self._model_combo.currentText().strip()
+            if prev_model_txt:
+                self._draft_models[prev_provider] = prev_model_txt
+
         self._active_provider = provider
         is_local = provider in {"ollama", "lmstudio"}
         is_gemini = provider == "gemini"
@@ -1528,12 +1819,18 @@ class DashboardWindow(QWidget):
         if is_local:
             self._api_key_edit.setText("")
             self._api_key_edit.setPlaceholderText("Для локальної моделі ключ не потрібен")
-        elif is_gemini:
-            self._api_key_edit.setText(self._config.gemini_api_key)
-            self._api_key_edit.setPlaceholderText("Вставте GEMINI_API_KEY...")
         else:
-            self._api_key_edit.setText(self._config.openai_api_key)
-            self._api_key_edit.setPlaceholderText("Вставте OPENAI_API_KEY...")
+            key_placeholders = {
+                "gemini": "Вставте GEMINI_API_KEY...",
+                "groq": "Вставте Groq API Key (gsk_...)...",
+                "cerebras": "Вставте Cerebras API Key (csk-...)...",
+                "openai": "Вставте OPENAI_API_KEY...",
+            }
+            restored_key = self._draft_keys.get(provider, get_provider_api_key(self._config, provider))
+            self._api_key_edit.setText(restored_key)
+            self._api_key_edit.setPlaceholderText(
+                key_placeholders.get(provider, "Вставте API-ключ...")
+            )
         self._api_key_edit.blockSignals(False)
 
         self._base_url_edit.blockSignals(True)
@@ -1543,19 +1840,24 @@ class DashboardWindow(QWidget):
         self._base_url_edit.setPlaceholderText(BASE_URL_PLACEHOLDERS.get(provider, ""))
         self._base_url_edit.blockSignals(False)
 
-        prev_model = self._model_combo.currentText().strip()
+        target_model = self._draft_models.get(provider) or get_provider_model(self._config, provider)
         self._model_combo.blockSignals(True)
         self._model_combo.clear()
         presets = MODEL_PRESETS.get(provider, [])
         for m in presets:
             self._model_combo.addItem(m)
-        if prev_model in presets:
-            self._model_combo.setCurrentText(prev_model)
+        if target_model:
+            self._model_combo.setCurrentText(target_model)
         elif presets:
             self._model_combo.setCurrentIndex(0)
         self._model_combo.blockSignals(False)
         self._update_model_warning(self._model_combo.currentText())
         self._test_result_lbl.setText("")
+        if provider_switched:
+            self._save_status_lbl.setStyleSheet("color: #FBBF24;")
+            self._save_status_lbl.setText(
+                "Є незбережені зміни — збережеться автоматично або натисніть «Зберегти та застосувати»."
+            )
 
     def _on_credentials_edited(self, _text: str) -> None:
         self._last_check_result = None
@@ -1578,19 +1880,32 @@ class DashboardWindow(QWidget):
     def _collect_config_from_ui(self) -> AppConfig:
         provider = str(self._provider_combo.currentData() or "openai")
         model_text = self._model_combo.currentText().strip()
+        key_text = self._api_key_edit.text().strip()
 
-        openai_key = self._config.openai_api_key
-        gemini_key = self._config.gemini_api_key
-        openai_model = self._config.openai_model
-        gemini_model = self._config.gemini_model
+        openai_key = self._draft_keys.get("openai", self._config.openai_api_key)
+        gemini_key = self._draft_keys.get("gemini", self._config.gemini_api_key)
+        groq_key = self._draft_keys.get("groq", self._config.groq_api_key)
+        cerebras_key = self._draft_keys.get("cerebras", self._config.cerebras_api_key)
+        openai_model = self._draft_models.get("openai", self._config.openai_model)
+        gemini_model = self._draft_models.get("gemini", self._config.gemini_model)
+        groq_model = self._draft_models.get("groq", self._config.groq_model)
+        cerebras_model = self._draft_models.get("cerebras", self._config.cerebras_model)
 
         if provider == "gemini":
-            gemini_key = self._api_key_edit.text().strip()
+            gemini_key = key_text
             if model_text:
                 gemini_model = model_text
+        elif provider == "groq":
+            groq_key = key_text
+            if model_text:
+                groq_model = model_text
+        elif provider == "cerebras":
+            cerebras_key = key_text
+            if model_text:
+                cerebras_model = model_text
         else:
             if provider not in {"ollama", "lmstudio"}:
-                openai_key = self._api_key_edit.text().strip()
+                openai_key = key_text
             if model_text:
                 openai_model = model_text
 
@@ -1603,6 +1918,10 @@ class DashboardWindow(QWidget):
             openai_api_key=openai_key,
             openai_base_url=base_url,
             openai_model=openai_model,
+            groq_api_key=groq_key,
+            groq_model=groq_model,
+            cerebras_api_key=cerebras_key,
+            cerebras_model=cerebras_model,
             gemini_api_key=gemini_key,
             gemini_model=gemini_model,
             llm_temperature=float(self._temp_spin.value()),
@@ -1612,6 +1931,13 @@ class DashboardWindow(QWidget):
             whisper_compute_type=str(self._whisper_compute_combo.currentData() or "float16"),
             whisper_language=str(self._whisper_lang_combo.currentData() or "uk"),
             whisper_beam_size=int(self._beam_size_spin.value()),
+            stt_provider=str(self._stt_provider_combo.currentData() or "local"),
+            stt_api_key=self._stt_api_key_edit.text().strip(),
+            stt_model=(
+                self._config.stt_model
+                if str(self._stt_provider_combo.currentData() or "local") == "local"
+                else self._stt_model_combo.currentText().strip()
+            ),
             audio_chunk_seconds=float(self._chunk_sec_spin.value()),
             audio_silence_seconds=float(self._silence_sec_spin.value()),
             audio_silence_threshold=round(float(self._silence_thresh_spin.value()), 4),
@@ -1750,6 +2076,7 @@ class DashboardWindow(QWidget):
         self._home_verify_btn.setEnabled(enabled)
 
     def _on_home_verify_key_clicked(self) -> None:
+        self._pending_settings_verify = False
         self._set_llm_check_buttons_enabled(False)
         self._set_dot(self._dot_llm, "warn")
         self._lbl_llm.setText("Перевірка API-ключа...")
@@ -1758,6 +2085,7 @@ class DashboardWindow(QWidget):
         self.test_llm_requested.emit(self._config)
 
     def _on_test_connection_clicked(self) -> None:
+        self._pending_settings_verify = True
         temp_cfg = self._collect_config_from_ui()
         self._set_llm_check_buttons_enabled(False)
         self._test_result_lbl.setStyleSheet("color: #93A2B8;")
@@ -1812,6 +2140,8 @@ class DashboardWindow(QWidget):
         )
 
     def set_api_check_result(self, result: ApiKeyCheckResult) -> None:
+        from_settings = self._pending_settings_verify
+        self._pending_settings_verify = False
         self._set_llm_check_buttons_enabled(True)
         self._last_check_result = result
 
@@ -1821,6 +2151,12 @@ class DashboardWindow(QWidget):
                 force_select_first_if_missing=(not result.model_valid),
             )
 
+        msg = result.message
+        if from_settings and result.ok:
+            self._on_save_settings_clicked()
+            if not self._settings_save_rejected and "Збережено" not in msg:
+                msg = f"{msg} · Збережено та активовано ✓"
+
         color_map = {
             "ok": "#4ADE80",
             "warn": "#FBBF24",
@@ -1828,7 +2164,7 @@ class DashboardWindow(QWidget):
         }
         color = color_map.get(result.status, "#F87171")
         self._test_result_lbl.setStyleSheet(f"color: {color}; font-weight: 500;")
-        self._test_result_lbl.setText(result.message)
+        self._test_result_lbl.setText(msg)
         self.refresh_readiness()
 
     def set_test_connection_result(self, ok: bool, message: str) -> None:
@@ -1872,6 +2208,8 @@ class DashboardWindow(QWidget):
             return
 
         self._config = replace(new_cfg)
+        self._draft_keys.clear()
+        self._draft_models.clear()
         self._sync_live_web_btn(new_cfg.web_search_enabled)
         self._sync_live_screen_btn(new_cfg.screen_vision_enabled)
         self._hk_answer_pill.setText(self._fmt_hotkey(new_cfg.hotkey_answer))
@@ -1921,6 +2259,78 @@ class DashboardWindow(QWidget):
     def _reset_prompt_default(self) -> None:
         self.prompt_edit.setPlainText(DEFAULT_SYSTEM_PROMPT)
 
+    def _on_profile_combo_changed(self, _idx: int) -> None:
+        pid = self.profile_combo.currentData()
+        if isinstance(pid, str) and pid:
+            self.profile_selected.emit(pid)
+
+    def _on_profile_lang_changed(self, _idx: int) -> None:
+        pid = self.profile_combo.currentData()
+        lang_code = self.profile_lang_combo.currentData()
+        if isinstance(pid, str) and pid and isinstance(lang_code, str):
+            self.profile_language_changed.emit(pid, lang_code)
+
+    def _on_new_profile_clicked(self) -> None:
+        name, ok = QInputDialog.getText(
+            self,
+            "Новий профіль",
+            "Назва профілю (напр. БД, Python, Історія):",
+        )
+        if ok and name.strip():
+            self.profile_create_requested.emit(name.strip())
+
+    def _on_rename_profile_clicked(self) -> None:
+        pid = self.profile_combo.currentData()
+        if not isinstance(pid, str) or not pid:
+            return
+        cur_name = self.profile_combo.currentText().strip()
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Перейменувати профіль",
+            "Нова назва профілю:",
+            text=cur_name,
+        )
+        if ok and new_name.strip() and new_name.strip() != cur_name:
+            self.profile_rename_requested.emit(pid, new_name.strip())
+
+    def _on_delete_profile_clicked(self) -> None:
+        pid = self.profile_combo.currentData()
+        if not isinstance(pid, str) or not pid or self.profile_combo.count() <= 1:
+            return
+        cur_name = self.profile_combo.currentText().strip()
+        reply = QMessageBox.question(
+            self,
+            "Видалити профіль",
+            f"Видалити профіль «{cur_name}»?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.profile_delete_requested.emit(pid)
+
+    def sync_profile_state(
+        self, cfg: AppConfig, profiles: list[PromptProfile], active_id: str
+    ) -> None:
+        """Synchronize Docs profile switcher, prompt/vocab fields, and Settings STT language."""
+        self._config = replace(cfg)
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        for prof in profiles:
+            self.profile_combo.addItem(prof.name, prof.id)
+        self._select_combo_by_data(self.profile_combo, active_id)
+        self.profile_combo.blockSignals(False)
+        self._delete_profile_btn.setEnabled(len(profiles) > 1)
+
+        active_prof = next((p for p in profiles if p.id == active_id), None)
+        lang_val = active_prof.stt_language if active_prof is not None else cfg.whisper_language
+        self.profile_lang_combo.blockSignals(True)
+        self._select_combo_by_data(self.profile_lang_combo, lang_val)
+        self.profile_lang_combo.blockSignals(False)
+
+        self.vocab_edit.setText(cfg.custom_vocabulary)
+        self.prompt_edit.setPlainText(cfg.system_prompt)
+        self._select_combo_by_data(self._whisper_lang_combo, cfg.whisper_language)
+
     # --- Live state updates ---
 
     def _set_dot(self, dot: QLabel, status: str) -> None:
@@ -1932,11 +2342,7 @@ class DashboardWindow(QWidget):
         has_creds = has_valid_llm_credentials(self._config)
         self._setup_banner.setVisible(not has_creds)
 
-        model_name = (
-            self._config.gemini_model
-            if self._config.llm_provider == "gemini"
-            else self._config.openai_model
-        )
+        model_name = get_provider_model(self._config)
         repl = get_deprecated_model_replacement(model_name)
 
         if not has_creds:
@@ -2070,6 +2476,35 @@ class DashboardWindow(QWidget):
         self._sb_overlay_btn.setText(text)
         self._live_overlay_btn.setText(text)
 
+    def _confirm_disable_stealth(self, target_name: str) -> bool:
+        reply = QMessageBox.warning(
+            self,
+            "Вимкнути Stealth-режим?",
+            f"Увага! Якщо вимкнути Stealth-режим ({target_name}), вікно стане видимим "
+            "під час демонстрації або запису екрана (Zoom, Discord, OBS, Teams).\n\n"
+            "Після перезапуску програми Stealth-режим знову увімкнеться автоматично.\n\n"
+            "Ви справді хочете вимкнути Stealth-режим зараз?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    def _on_ov_stealth_checkbox_clicked(self, checked: bool) -> None:
+        if not checked and not self._confirm_disable_stealth("оверлей"):
+            self._ov_stealth_chk.blockSignals(True)
+            self._ov_stealth_chk.setChecked(True)
+            self._ov_stealth_chk.blockSignals(False)
+            return
+        self._auto_save_settings_if_valid()
+
+    def _on_dash_stealth_checkbox_clicked(self, checked: bool) -> None:
+        if not checked and not self._confirm_disable_stealth("панель керування"):
+            self._dash_stealth_chk.blockSignals(True)
+            self._dash_stealth_chk.setChecked(True)
+            self._dash_stealth_chk.blockSignals(False)
+            return
+        self._auto_save_settings_if_valid()
+
     def set_overlay_stealth(self, enabled: bool) -> None:
         """Synchronize overlay stealth state in dashboard config, settings UI, and readiness."""
         state = bool(enabled)
@@ -2078,6 +2513,17 @@ class DashboardWindow(QWidget):
             self._ov_stealth_chk.blockSignals(True)
             self._ov_stealth_chk.setChecked(state)
             self._ov_stealth_chk.blockSignals(False)
+        self.refresh_readiness()
+
+    def set_dashboard_stealth(self, enabled: bool) -> None:
+        """Synchronize dashboard stealth state, DWM affinity, and watchdog timer."""
+        state = bool(enabled)
+        self._config.dashboard_stealth = state
+        if self._dash_stealth_chk.isChecked() != state:
+            self._dash_stealth_chk.blockSignals(True)
+            self._dash_stealth_chk.setChecked(state)
+            self._dash_stealth_chk.blockSignals(False)
+        self._apply_dashboard_stealth()
         self.refresh_readiness()
 
     def set_overlay_opacity(self, percent: int) -> None:
@@ -2091,13 +2537,13 @@ class DashboardWindow(QWidget):
         self._ov_opacity_lbl.setText(f"{clamped}%")
 
     def set_whisper_status(self, text: str) -> None:
-        clean = text.replace("Whisper:", "").strip()
+        clean = text.replace("Whisper:", "").replace("STT:", "").strip()
         self._lbl_whisper.setText(clean)
         low = text.lower()
-        if "помилка" in low:
+        if "помилка" in low or "немає api-ключа" in low:
             self._set_dot(self._dot_whisper, "error")
             self._whisper_progress.setVisible(False)
-        elif "завантаження" in low or "ініціалізація" in low:
+        elif "завантаження" in low or "ініціалізація" in low or "підключення" in low or "перепідключення" in low:
             self._set_dot(self._dot_whisper, "warn")
             self._whisper_progress.setVisible(True)
         elif "cpu" in low:

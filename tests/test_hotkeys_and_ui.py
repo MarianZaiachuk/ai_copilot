@@ -260,6 +260,194 @@ def test_polish_ui_stop_nav_validation_markdown_and_icons() -> None:
         dash.set_documents(cm.documents, cm.summary())
         assert dash.docs_list.count() == 2
 
+    # Verify WindowsSingleInstanceGuard blocks duplicate acquisitions until released
+    guard1 = app_main.WindowsSingleInstanceGuard("Local\\ZoomAICopilot_TestMutex_Unit_1")
+    guard2 = app_main.WindowsSingleInstanceGuard("Local\\ZoomAICopilot_TestMutex_Unit_1")
+    try:
+        assert guard1.acquire() is True
+        assert guard2.acquire() is False
+    finally:
+        guard1.release()
+        guard2.release()
+    guard3 = app_main.WindowsSingleInstanceGuard("Local\\ZoomAICopilot_TestMutex_Unit_1")
+    try:
+        assert guard3.acquire() is True
+    finally:
+        guard3.release()
+
+    # Verify STT engine selector updates UI rows and collects config fields properly
+    dash.open_settings(1)
+    idx_dg = dash._stt_provider_combo.findData("deepgram")
+    dash._stt_provider_combo.setCurrentIndex(idx_dg)
+    dash._stt_api_key_edit.setText("dg-ui-test-key-123456")
+    collected_dg = dash._collect_config_from_ui()
+    assert collected_dg.stt_provider == "deepgram"
+    assert collected_dg.stt_model == "nova-3"
+    assert collected_dg.stt_api_key == "dg-ui-test-key-123456"
+
+    # Provider switching isolates keys/models, auto-saves on verified key check, and saves on exit from Settings
+    dash._hk_answer_edit.setText("ctrl+space")
+    dash._hk_toggle_edit.setText("ctrl+shift+h")
+    dash.open_settings(0)
+    idx_cerebras = dash._provider_combo.findData("cerebras")
+    dash._provider_combo.setCurrentIndex(idx_cerebras)
+    assert dash._api_key_edit.text() == ""
+    assert dash._model_combo.currentText() == "qwen-3.8-27b"
+    dash._api_key_edit.setText("csk-verified-cerebras-123456")
+    dash._on_test_connection_clicked()
+    dash.set_api_check_result(
+        llm_client.ApiKeyCheckResult(
+            ok=True,
+            key_valid=True,
+            model_valid=True,
+            status="ok",
+            message="Ключ працює",
+            available_models=["qwen-3.8-27b", "gpt-oss-120b"],
+            latency_sec=0.2,
+        )
+    )
+    assert saved_cfgs[-1].llm_provider == "cerebras"
+    assert saved_cfgs[-1].cerebras_api_key == "csk-verified-cerebras-123456"
+    assert saved_cfgs[-1].groq_api_key == "gsk_test_ui_polish_1234567890"
+    assert "Збережено" in dash._test_result_lbl.text()
+
+    idx_groq = dash._provider_combo.findData("groq")
+    dash._provider_combo.setCurrentIndex(idx_groq)
+    assert dash._api_key_edit.text() == "gsk_test_ui_polish_1234567890"
+    prev_save_count = len(saved_cfgs)
+    dash._switch_page(0)
+    assert len(saved_cfgs) == prev_save_count + 1
+    assert saved_cfgs[-1].llm_provider == "groq"
+
+    # Profile switcher sync, signals, and compact dashboard minimumSizeHint
+    selected_profiles: list[str] = []
+    changed_langs: list[tuple[str, str]] = []
+    dash.profile_selected.connect(selected_profiles.append)
+    dash.profile_language_changed.connect(lambda pid, lang: changed_langs.append((pid, lang)))
+
+    p_cs = config.PromptProfile(
+        id="csharp-defense",
+        name="Захист C#",
+        system_prompt="Промпт C#",
+        stt_language="uk",
+        custom_vocabulary="WPF",
+    )
+    p_en = config.PromptProfile(
+        id="english-speaking",
+        name="Англійська",
+        system_prompt="Speak natural English.",
+        stt_language="en+uk",
+        custom_vocabulary="",
+    )
+    dash.sync_profile_state(
+        config.AppConfig(
+            system_prompt="Speak natural English.",
+            whisper_language="en+uk",
+            custom_vocabulary="",
+        ),
+        [p_cs, p_en],
+        "english-speaking",
+    )
+    assert dash.profile_combo.currentData() == "english-speaking"
+    assert dash.profile_lang_combo.currentData() == "en+uk"
+    assert dash.prompt_edit.toPlainText() == "Speak natural English."
+
+    dash.profile_combo.setCurrentIndex(0)
+    assert selected_profiles == ["csharp-defense"]
+
+    idx_en_only = dash.profile_lang_combo.findData("en")
+    dash.profile_lang_combo.setCurrentIndex(idx_en_only)
+    assert changed_langs == [("csharp-defense", "en")]
+
+    updated_min = dash.minimumSizeHint()
+    assert updated_min.width() <= 840 and updated_min.height() <= 560
+
+    # Closing Dashboard when tray is active still hides to tray instead of quitting
+    dash.set_hide_to_tray(True)
+    minimized_signals: list[int] = []
+    dash.minimized_to_tray.connect(lambda: minimized_signals.append(1))
+    dash.close()
+    assert len(minimized_signals) == 1
+
+    ov.close()
+    dash.force_close()
+    app.processEvents()
+
+
+def test_stealth_locked_everywhere_except_settings_warning(monkeypatch) -> None:
+    from PyQt6.QtWidgets import QMessageBox
+
+    app = QApplication.instance() or QApplication([])
+    cfg = config.AppConfig(
+        llm_provider="groq",
+        openai_api_key="gsk_test_stealth_lock_1234567890",
+        openai_model="qwen/qwen3.8-27b",
+    )
+    assert cfg.overlay_stealth is True
+    assert cfg.dashboard_stealth is True
+
+    dash = dashboard.DashboardWindow(config=cfg)
+    ov = ui.CopilotOverlayWindow(stealth_enabled=True)
+
+    # Compact title bar & Dashboard min size remain within bounds
+    assert ov._title_bar.minimumSizeHint().width() <= 430
+    dash_min = dash.minimumSizeHint()
+    assert dash_min.width() <= 840 and dash_min.height() <= 560
+
+    # Clicking the overlay Stealth badge must NOT turn off Stealth or emit stealth_toggled
+    stealth_signals: list[bool] = []
+    ov.stealth_toggled.connect(stealth_signals.append)
+    assert ov._stealth_btn.isCheckable() is False
+    ov._stealth_btn.click()
+    assert ov.stealth_enabled is True
+    assert stealth_signals == []
+
+    # Disabling Stealth in Settings requires confirmation via QMessageBox.warning
+    saved_cfgs: list[config.AppConfig] = []
+    dash.settings_saved.connect(saved_cfgs.append)
+    dash.open_settings(2)
+
+    warn_calls: list[str] = []
+    next_reply = QMessageBox.StandardButton.No
+
+    def _fake_warning(_parent, title, _text, _buttons=None, _default=None):
+        warn_calls.append(str(title))
+        return next_reply
+
+    monkeypatch.setattr(dashboard.QMessageBox, "warning", _fake_warning)
+
+    # User declines warning for overlay stealth -> reverts to checked, nothing saved
+    dash._ov_stealth_chk.click()
+    assert len(warn_calls) == 1
+    assert dash._ov_stealth_chk.isChecked() is True
+    assert dash._collect_config_from_ui().overlay_stealth is True
+    assert saved_cfgs == []
+
+    # User declines warning for dashboard stealth -> reverts to checked, nothing saved
+    dash._dash_stealth_chk.click()
+    assert len(warn_calls) == 2
+    assert dash._dash_stealth_chk.isChecked() is True
+    assert dash._collect_config_from_ui().dashboard_stealth is True
+    assert saved_cfgs == []
+
+    # User confirms warning -> allows disabling overlay and dashboard stealth
+    next_reply = QMessageBox.StandardButton.Yes
+    dash._ov_stealth_chk.click()
+    assert len(warn_calls) == 3
+    assert dash._ov_stealth_chk.isChecked() is False
+    assert len(saved_cfgs) == 1 and saved_cfgs[-1].overlay_stealth is False
+
+    dash._dash_stealth_chk.click()
+    assert len(warn_calls) == 4
+    assert dash._dash_stealth_chk.isChecked() is False
+    assert len(saved_cfgs) == 2 and saved_cfgs[-1].dashboard_stealth is False
+
+    # Re-enabling overlay stealth does NOT trigger a warning dialog
+    dash._ov_stealth_chk.click()
+    assert len(warn_calls) == 4
+    assert dash._ov_stealth_chk.isChecked() is True
+    assert len(saved_cfgs) == 3 and saved_cfgs[-1].overlay_stealth is True
+
     ov.close()
     dash.force_close()
     app.processEvents()

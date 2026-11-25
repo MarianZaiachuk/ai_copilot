@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import json
 import math
 import os
 from pathlib import Path
@@ -11,15 +12,17 @@ import site
 import sys
 import tempfile
 from typing import Any
+import uuid
 
 from dotenv import load_dotenv
 
 from security import register_secret
 
 VALID_LLM_PROVIDERS: frozenset[str] = frozenset(
-    {"openai", "groq", "gemini", "ollama", "lmstudio"}
+    {"openai", "groq", "cerebras", "gemini", "ollama", "lmstudio"}
 )
 VALID_WHISPER_DEVICES: frozenset[str] = frozenset({"cuda", "cpu", "auto"})
+VALID_STT_PROVIDERS: frozenset[str] = frozenset({"local", "deepgram", "groq", "elevenlabs"})
 VALID_SEARCH_PROVIDERS: frozenset[str] = frozenset(
     {"auto", "ddgs", "tavily", "brave", "wikipedia"}
 )
@@ -32,6 +35,15 @@ DEFAULT_SYSTEM_PROMPT = (
     '("Звісно", "Ось відповідь"). Використовуй короткі буліт-поїнти, щоб '
     'відповідь можна було прочитати за 2 секунди і переказати своїми словами.'
 )
+DEFAULT_ENGLISH_SYSTEM_PROMPT = (
+    "You are a spoken English assistant helping a student during a live conversational "
+    "English class. Understand questions asked in English, Ukrainian, or mixed speech. "
+    "Give a natural, well-developed spoken English answer (3-6 clear sentences, conversational "
+    "B1-B2+ tone, with a concrete example or natural phrasing the student can speak smoothly). "
+    "No meta-intros like 'Sure' or 'Here is your answer'. "
+    "At the end, add one short Ukrainian line (`🇺🇦 ...`) explaining the main idea or key words."
+)
+VALID_STT_LANGUAGES: frozenset[str] = frozenset({"uk", "en", "en+uk", "auto", ""})
 
 _DLL_DIR_HANDLES: list[Any] = []
 _REGISTERED_DLL_DIRS: set[str] = set()
@@ -251,6 +263,10 @@ class AppConfig:
     openai_api_key: str = ""
     openai_base_url: str = ""
     openai_model: str = "gpt-6-luna"
+    groq_api_key: str = ""
+    groq_model: str = ""
+    cerebras_api_key: str = ""
+    cerebras_model: str = ""
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"
     llm_temperature: float = 0.2
@@ -261,10 +277,13 @@ class AppConfig:
     whisper_compute_type: str = "float16"
     whisper_language: str = "uk"
     whisper_beam_size: int = 5
+    stt_provider: str = "local"
+    stt_api_key: str = ""
+    stt_model: str = ""
 
     audio_chunk_seconds: float = 5.0
     audio_overlap_seconds: float = 0.85
-    audio_silence_seconds: float = 0.8
+    audio_silence_seconds: float = 0.5
     audio_silence_threshold: float = 0.006
 
     transcript_window_seconds: int = 60
@@ -277,7 +296,7 @@ class AppConfig:
 
     overlay_opacity: int = 92
     overlay_stealth: bool = True
-    dashboard_stealth: bool = False
+    dashboard_stealth: bool = True
     overlay_font_scale: float = 1.0
 
     web_search_enabled: bool = False
@@ -292,6 +311,58 @@ class AppConfig:
     screen_capture_max_width: int = 1600
 
 
+def get_provider_api_key(config: AppConfig, provider: str | None = None) -> str:
+    """Return the configured API key for a specific LLM provider without cross-leaking keys."""
+    prov = (provider or config.llm_provider or "openai").strip().lower()
+    if prov == "gemini":
+        return config.gemini_api_key.strip()
+    if prov == "groq":
+        direct = config.groq_api_key.strip()
+        if direct:
+            return direct
+        legacy = config.openai_api_key.strip()
+        if (config.llm_provider or "").strip().lower() == "groq" or legacy.startswith("gsk_"):
+            return legacy
+        return ""
+    if prov == "cerebras":
+        direct = config.cerebras_api_key.strip()
+        if direct:
+            return direct
+        legacy = config.openai_api_key.strip()
+        if (config.llm_provider or "").strip().lower() == "cerebras" or legacy.startswith("csk-"):
+            return legacy
+        return ""
+    if prov == "openai":
+        key = config.openai_api_key.strip()
+        if (config.llm_provider or "").strip().lower() == "openai" or not key.startswith(
+            ("gsk_", "csk-")
+        ):
+            return key
+        return ""
+    return config.openai_api_key.strip()
+
+
+def get_provider_model(config: AppConfig, provider: str | None = None) -> str:
+    """Return the active or default model ID for a specific LLM provider."""
+    prov = (provider or config.llm_provider or "openai").strip().lower()
+    active_prov = (config.llm_provider or "").strip().lower()
+    if prov == "gemini":
+        return config.gemini_model.strip() or "gemini-3.8-flash"
+    if prov == "groq":
+        return config.groq_model.strip() or (
+            config.openai_model.strip() if active_prov == "groq" else "qwen/qwen3.8-27b"
+        )
+    if prov == "cerebras":
+        return config.cerebras_model.strip() or (
+            config.openai_model.strip() if active_prov == "cerebras" else "qwen-3.8-27b"
+        )
+    if prov == "ollama":
+        return config.openai_model.strip() if active_prov == "ollama" else "qwen2.5:14b"
+    if prov == "lmstudio":
+        return config.openai_model.strip() if active_prov == "lmstudio" else "local-model"
+    return config.openai_model.strip() or "gpt-6-luna"
+
+
 def has_valid_llm_credentials(config: AppConfig) -> bool:
     """Return True if the selected LLM provider has required credentials (or is local)."""
     provider = config.llm_provider.lower()
@@ -299,9 +370,7 @@ def has_valid_llm_credentials(config: AppConfig) -> bool:
         return False
     if provider in {"ollama", "lmstudio"}:
         return True
-    if provider == "gemini":
-        return bool(config.gemini_api_key.strip())
-    return bool(config.openai_api_key.strip())
+    return bool(get_provider_api_key(config, provider))
 
 
 def load_config(env_path: str | None = None, override: bool = False) -> AppConfig:
@@ -351,6 +420,9 @@ def load_config(env_path: str | None = None, override: bool = False) -> AppConfi
     raw_whisper_dev = _env_str("WHISPER_DEVICE", "cuda").lower()
     whisper_device = raw_whisper_dev if raw_whisper_dev in VALID_WHISPER_DEVICES else "cuda"
 
+    raw_stt_prov = _env_str("STT_PROVIDER", "local").lower()
+    stt_provider = raw_stt_prov if raw_stt_prov in VALID_STT_PROVIDERS else "local"
+
     raw_web_prov = _env_str("WEB_SEARCH_PROVIDER", "auto").lower()
     web_provider = (
         raw_web_prov if raw_web_prov in VALID_SEARCH_PROVIDERS else "auto"
@@ -358,11 +430,30 @@ def load_config(env_path: str | None = None, override: bool = False) -> AppConfi
     raw_agent_mode = _env_str("WEB_AGENT_MODE", "agent").lower()
     web_agent_mode = raw_agent_mode if raw_agent_mode in VALID_AGENT_MODES else "agent"
 
+    raw_openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    raw_openai_model = _env_str("OPENAI_MODEL", "gpt-6-luna")
+    groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not groq_api_key and (llm_provider == "groq" or raw_openai_key.startswith("gsk_")):
+        groq_api_key = raw_openai_key
+    groq_model = os.getenv("GROQ_MODEL", "").strip()
+    if not groq_model and llm_provider == "groq":
+        groq_model = raw_openai_model
+    cerebras_api_key = os.getenv("CEREBRAS_API_KEY", "").strip()
+    if not cerebras_api_key and (llm_provider == "cerebras" or raw_openai_key.startswith("csk-")):
+        cerebras_api_key = raw_openai_key
+    cerebras_model = os.getenv("CEREBRAS_MODEL", "").strip()
+    if not cerebras_model and llm_provider == "cerebras":
+        cerebras_model = raw_openai_model
+
     cfg = AppConfig(
         llm_provider=llm_provider,
-        openai_api_key=os.getenv("OPENAI_API_KEY", "").strip(),
+        openai_api_key=raw_openai_key,
         openai_base_url=os.getenv("OPENAI_BASE_URL", "").strip(),
-        openai_model=_env_str("OPENAI_MODEL", "gpt-6-luna"),
+        openai_model=raw_openai_model,
+        groq_api_key=groq_api_key,
+        groq_model=groq_model,
+        cerebras_api_key=cerebras_api_key,
+        cerebras_model=cerebras_model,
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
         gemini_model=_env_str("GEMINI_MODEL", "gemini-3.8-flash"),
         llm_temperature=_parse_float(
@@ -378,10 +469,13 @@ def load_config(env_path: str | None = None, override: bool = False) -> AppConfi
         whisper_beam_size=_parse_int(
             os.getenv("WHISPER_BEAM_SIZE"), 5, minimum=1, maximum=10
         ),
+        stt_provider=stt_provider,
+        stt_api_key=os.getenv("STT_API_KEY", "").strip(),
+        stt_model=os.getenv("STT_MODEL", "").strip(),
         audio_chunk_seconds=chunk_seconds,
         audio_overlap_seconds=overlap_seconds,
         audio_silence_seconds=_parse_float(
-            os.getenv("AUDIO_SILENCE_SECONDS"), 0.8, minimum=0.2, maximum=5.0
+            os.getenv("AUDIO_SILENCE_SECONDS"), 0.5, minimum=0.2, maximum=5.0
         ),
         audio_silence_threshold=_parse_float(
             os.getenv("AUDIO_SILENCE_THRESHOLD"), 0.006, minimum=0.0005, maximum=0.5
@@ -403,7 +497,7 @@ def load_config(env_path: str | None = None, override: bool = False) -> AppConfi
             os.getenv("OVERLAY_OPACITY"), 92, minimum=30, maximum=100
         ),
         overlay_stealth=_parse_bool(os.getenv("OVERLAY_STEALTH"), True),
-        dashboard_stealth=_parse_bool(os.getenv("DASHBOARD_STEALTH"), False),
+        dashboard_stealth=_parse_bool(os.getenv("DASHBOARD_STEALTH"), True),
         overlay_font_scale=_parse_float(
             os.getenv("OVERLAY_FONT_SCALE"), 1.0, minimum=0.85, maximum=1.40
         ),
@@ -424,8 +518,12 @@ def load_config(env_path: str | None = None, override: bool = False) -> AppConfi
         ),
     )
     register_secret(cfg.openai_api_key)
+    register_secret(cfg.groq_api_key)
+    register_secret(cfg.cerebras_api_key)
     register_secret(cfg.gemini_api_key)
     register_secret(cfg.web_search_api_key)
+    register_secret(cfg.stt_api_key)
+    register_secret(os.getenv("ELEVENLABS_API_KEY", "").strip())
     return cfg
 
 
@@ -450,14 +548,24 @@ def save_config_to_env(config: AppConfig, env_path: Path | None = None) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
 
     register_secret(config.openai_api_key)
+    register_secret(config.groq_api_key)
+    register_secret(config.cerebras_api_key)
     register_secret(config.gemini_api_key)
     register_secret(config.web_search_api_key)
+    register_secret(config.stt_api_key)
+
+    raw_stt = (config.stt_provider or "local").strip().lower()
+    stt_prov = raw_stt if raw_stt in VALID_STT_PROVIDERS else "local"
 
     pairs: list[tuple[str, str]] = [
         ("LLM_PROVIDER", config.llm_provider.strip().lower()),
         ("OPENAI_API_KEY", config.openai_api_key.strip()),
         ("OPENAI_BASE_URL", config.openai_base_url.strip()),
         ("OPENAI_MODEL", config.openai_model.strip()),
+        ("GROQ_API_KEY", config.groq_api_key.strip()),
+        ("GROQ_MODEL", config.groq_model.strip()),
+        ("CEREBRAS_API_KEY", config.cerebras_api_key.strip()),
+        ("CEREBRAS_MODEL", config.cerebras_model.strip()),
         ("GEMINI_API_KEY", config.gemini_api_key.strip()),
         ("GEMINI_MODEL", config.gemini_model.strip()),
         ("LLM_TEMPERATURE", f"{config.llm_temperature:.2f}"),
@@ -467,6 +575,9 @@ def save_config_to_env(config: AppConfig, env_path: Path | None = None) -> Path:
         ("WHISPER_COMPUTE_TYPE", config.whisper_compute_type.strip()),
         ("WHISPER_LANGUAGE", config.whisper_language.strip()),
         ("WHISPER_BEAM_SIZE", str(config.whisper_beam_size)),
+        ("STT_PROVIDER", stt_prov),
+        ("STT_API_KEY", config.stt_api_key.strip()),
+        ("STT_MODEL", config.stt_model.strip()),
         ("AUDIO_CHUNK_SECONDS", f"{config.audio_chunk_seconds:.2f}"),
         ("AUDIO_OVERLAP_SECONDS", f"{config.audio_overlap_seconds:.2f}"),
         ("AUDIO_SILENCE_SECONDS", f"{config.audio_silence_seconds:.2f}"),
@@ -492,6 +603,14 @@ def save_config_to_env(config: AppConfig, env_path: Path | None = None) -> Path:
         ("SCREEN_CAPTURE_MAX_WIDTH", str(max(800, min(2560, int(config.screen_capture_max_width))))),
         ("SYSTEM_PROMPT", config.system_prompt.strip() or DEFAULT_SYSTEM_PROMPT),
     ]
+    el_env_key = (
+        config.stt_api_key.strip()
+        if (stt_prov == "elevenlabs" and config.stt_api_key.strip())
+        else os.getenv("ELEVENLABS_API_KEY", "").strip()
+    )
+    if el_env_key:
+        register_secret(el_env_key)
+        pairs.append(("ELEVENLABS_API_KEY", el_env_key))
 
     lines = ["# AI Copilot for Zoom — User Configuration"]
     for key, val in pairs:
@@ -523,3 +642,237 @@ def save_config_to_env(config: AppConfig, env_path: Path | None = None) -> Path:
         raise
 
     return target
+
+
+@dataclass
+class PromptProfile:
+    """Subject profile bundling prompt, STT language, vocabulary, and workspace docs."""
+
+    id: str
+    name: str
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT
+    stt_language: str = "uk"
+    custom_vocabulary: str = ""
+    context_paths: list[str] = field(default_factory=list)
+
+
+class ProfileStore:
+    """JSON-backed persistence for subject profiles and last active profile ID."""
+
+    def __init__(
+        self,
+        path: Path,
+        profiles: list[PromptProfile],
+        active_profile_id: str,
+    ) -> None:
+        self.path = Path(path)
+        self.profiles = profiles
+        self.active_profile_id = active_profile_id
+
+    @staticmethod
+    def _sanitize_lang(raw: Any) -> str:
+        norm = str(raw or "").strip().lower()
+        return norm if norm in VALID_STT_LANGUAGES else "uk"
+
+    @classmethod
+    def load_or_init(
+        cls,
+        path: Path,
+        config: AppConfig,
+        legacy_context_paths: list[str] | None = None,
+    ) -> ProfileStore:
+        target = Path(path)
+        if target.is_file():
+            try:
+                raw_data = json.loads(target.read_text(encoding="utf-8"))
+                raw_profiles = raw_data.get("profiles", []) if isinstance(raw_data, dict) else []
+                parsed: list[PromptProfile] = []
+                seen_ids: set[str] = set()
+                for entry in raw_profiles:
+                    if not isinstance(entry, dict):
+                        continue
+                    pid = str(entry.get("id", "") or "").strip()
+                    pname = str(entry.get("name", "") or "").strip()
+                    if not pid or not pname or pid in seen_ids:
+                        continue
+                    seen_ids.add(pid)
+                    raw_paths = entry.get("context_paths", [])
+                    clean_paths = (
+                        [str(p) for p in raw_paths if isinstance(p, str) and p.strip()]
+                        if isinstance(raw_paths, list)
+                        else []
+                    )
+                    parsed.append(
+                        PromptProfile(
+                            id=pid,
+                            name=pname,
+                            system_prompt=(
+                                str(entry.get("system_prompt") or "").strip()
+                                or DEFAULT_SYSTEM_PROMPT
+                            ),
+                            stt_language=cls._sanitize_lang(entry.get("stt_language", "uk")),
+                            custom_vocabulary=str(entry.get("custom_vocabulary") or "").strip(),
+                            context_paths=clean_paths,
+                        )
+                    )
+                if parsed:
+                    active_id = str(raw_data.get("active_profile_id", "") or "").strip()
+                    if not any(p.id == active_id for p in parsed):
+                        active_id = parsed[0].id
+                    return cls(target, parsed, active_id)
+            except Exception:
+                pass
+
+        seeded = [
+            PromptProfile(
+                id="csharp-defense",
+                name="Захист C#",
+                system_prompt=(config.system_prompt.strip() or DEFAULT_SYSTEM_PROMPT),
+                stt_language=cls._sanitize_lang(config.whisper_language),
+                custom_vocabulary=config.custom_vocabulary.strip(),
+                context_paths=[
+                    str(p) for p in (legacy_context_paths or []) if isinstance(p, str) and p.strip()
+                ],
+            ),
+            PromptProfile(
+                id="english-speaking",
+                name="Англійська",
+                system_prompt=DEFAULT_ENGLISH_SYSTEM_PROMPT,
+                stt_language="en+uk",
+                custom_vocabulary="",
+                context_paths=[],
+            ),
+        ]
+        store = cls(target, seeded, "csharp-defense")
+        store.save()
+        return store
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "active_profile_id": self.active_profile_id,
+            "profiles": [
+                {
+                    "id": p.id,
+                    "name": p.name,
+                    "system_prompt": p.system_prompt,
+                    "stt_language": p.stt_language,
+                    "custom_vocabulary": p.custom_vocabulary,
+                    "context_paths": list(p.context_paths),
+                }
+                for p in self.profiles
+            ],
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(self.path.parent),
+                prefix=".profiles.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                tmp_path = Path(handle.name)
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self.path)
+        except Exception:
+            if tmp_path is not None and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def get(self, profile_id: str) -> PromptProfile | None:
+        for prof in self.profiles:
+            if prof.id == profile_id:
+                return prof
+        return None
+
+    def active_profile(self) -> PromptProfile:
+        prof = self.get(self.active_profile_id)
+        if prof is not None:
+            return prof
+        self.active_profile_id = self.profiles[0].id
+        return self.profiles[0]
+
+    def set_active(self, profile_id: str) -> PromptProfile | None:
+        prof = self.get(profile_id)
+        if prof is None:
+            return None
+        if self.active_profile_id != prof.id:
+            self.active_profile_id = prof.id
+            self.save()
+        return prof
+
+    def create_profile(
+        self,
+        name: str,
+        *,
+        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        stt_language: str = "uk",
+        custom_vocabulary: str = "",
+        context_paths: list[str] | None = None,
+    ) -> PromptProfile:
+        cleaned_name = name.strip() or f"Профіль {len(self.profiles) + 1}"
+        existing_ids = {p.id for p in self.profiles}
+        new_id = f"profile-{uuid.uuid4().hex[:8]}"
+        while new_id in existing_ids:
+            new_id = f"profile-{uuid.uuid4().hex[:8]}"
+        prof = PromptProfile(
+            id=new_id,
+            name=cleaned_name,
+            system_prompt=(system_prompt.strip() or DEFAULT_SYSTEM_PROMPT),
+            stt_language=self._sanitize_lang(stt_language),
+            custom_vocabulary=custom_vocabulary.strip(),
+            context_paths=list(context_paths or []),
+        )
+        self.profiles.append(prof)
+        self.active_profile_id = prof.id
+        self.save()
+        return prof
+
+    def update_profile(
+        self,
+        profile_id: str,
+        *,
+        name: str | None = None,
+        system_prompt: str | None = None,
+        stt_language: str | None = None,
+        custom_vocabulary: str | None = None,
+        context_paths: list[str] | None = None,
+    ) -> PromptProfile | None:
+        prof = self.get(profile_id)
+        if prof is None:
+            return None
+        if name is not None and name.strip():
+            prof.name = name.strip()
+        if system_prompt is not None:
+            prof.system_prompt = system_prompt.strip() or DEFAULT_SYSTEM_PROMPT
+        if stt_language is not None:
+            prof.stt_language = self._sanitize_lang(stt_language)
+        if custom_vocabulary is not None:
+            prof.custom_vocabulary = custom_vocabulary.strip()
+        if context_paths is not None:
+            prof.context_paths = [
+                str(p) for p in context_paths if isinstance(p, str) and p.strip()
+            ]
+        self.save()
+        return prof
+
+    def delete_profile(self, profile_id: str) -> PromptProfile | None:
+        if len(self.profiles) <= 1:
+            return None
+        idx = next((i for i, p in enumerate(self.profiles) if p.id == profile_id), -1)
+        if idx < 0:
+            return None
+        self.profiles.pop(idx)
+        if self.active_profile_id == profile_id:
+            fallback_idx = min(idx, len(self.profiles) - 1)
+            self.active_profile_id = self.profiles[fallback_idx].id
+        self.save()
+        return self.active_profile()

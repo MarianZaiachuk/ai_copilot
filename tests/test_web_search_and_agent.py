@@ -546,7 +546,7 @@ def test_docs_first_policy_across_agent_fast_and_gemini() -> None:
     assert agent_sw.call_count == 0
     assert any("Аналізую ваші документи" in s for s in agent_statuses)
     sent_msgs = fake_agent.chat.completions.create.call_args.kwargs["messages"]
-    assert "ОБОВ'ЯЗКОВИЙ ПОРЯДОК АНАЛІЗУ" in sent_msgs[0]["content"]
+    assert "MANDATORY ORDER" in sent_msgs[0]["content"]
 
     # 2. Fast mode with loaded documents (answer exists in docs -> zero web calls)
     fake_fast_hit = MagicMock()
