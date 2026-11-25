@@ -29,11 +29,14 @@ VALID_SEARCH_PROVIDERS: frozenset[str] = frozenset(
 VALID_AGENT_MODES: frozenset[str] = frozenset({"agent", "fast"})
 
 DEFAULT_SYSTEM_PROMPT = (
-    'Ти — асистент студента на усному захисті роботи. Твоє завдання — давати '
-    'максимально стислі, точні, тезисні відповіді українською мовою на питання '
-    'викладача, спираючись на наданий контекст роботи. Без вступних слів '
-    '("Звісно", "Ось відповідь"). Використовуй короткі буліт-поїнти, щоб '
-    'відповідь можна було прочитати за 2 секунди і переказати своїми словами.'
+    "Ти — асистент студента на усному захисті роботи. Твоє завдання — давати точні, природні "
+    "та зрозумілі відповіді українською мовою виключно на останнє питання викладача. "
+    "ВАЖЛИВО розрізняти тип питання: "
+    "1) Якщо питають загальну теорію, математику/фізику чи по графіку/малюнку на екрані — "
+    "відповідай ТІЛЬКИ по теорії та графіку (означення + як/де це показати на осях чи кривій), "
+    "НЕ згадуй класи, змінні чи код з файлів проєкту, якщо про код не питали. "
+    "2) Якщо питають про реалізацію або код роботи — тоді спирайся на завантажений контекст і наводь конкретні деталі з нього. "
+    "Без вступних слів («Звісно», «Ось відповідь»). Починай з 1–2 речень прямої суті, далі 2–4 короткі тези, щоб зручно переказати вголос."
 )
 DEFAULT_ENGLISH_SYSTEM_PROMPT = (
     "You are a spoken English assistant helping a student during a live conversational "
@@ -292,6 +295,9 @@ class AppConfig:
     custom_vocabulary: str = ""
     hotkey_answer: str = "ctrl+space"
     hotkey_toggle: str = "ctrl+shift+h"
+    hotkey_screen: str = "ctrl+alt+s"
+    hotkey_web: str = "ctrl+alt+w"
+    hotkey_capture: str = "ctrl+alt+r"
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
 
     overlay_opacity: int = 92
@@ -492,6 +498,9 @@ def load_config(env_path: str | None = None, override: bool = False) -> AppConfi
         custom_vocabulary=os.getenv("CUSTOM_VOCABULARY", "").strip(),
         hotkey_answer=_env_str("HOTKEY_ANSWER", "ctrl+space").lower(),
         hotkey_toggle=_env_str("HOTKEY_TOGGLE", "ctrl+shift+h").lower(),
+        hotkey_screen=_env_str("HOTKEY_SCREEN", "ctrl+alt+s").lower(),
+        hotkey_web=_env_str("HOTKEY_WEB", "ctrl+alt+w").lower(),
+        hotkey_capture=_env_str("HOTKEY_CAPTURE", "ctrl+alt+r").lower(),
         system_prompt=system_prompt,
         overlay_opacity=_parse_int(
             os.getenv("OVERLAY_OPACITY"), 92, minimum=30, maximum=100
@@ -588,6 +597,9 @@ def save_config_to_env(config: AppConfig, env_path: Path | None = None) -> Path:
         ("CUSTOM_VOCABULARY", config.custom_vocabulary.strip()),
         ("HOTKEY_ANSWER", config.hotkey_answer.strip().lower()),
         ("HOTKEY_TOGGLE", config.hotkey_toggle.strip().lower()),
+        ("HOTKEY_SCREEN", config.hotkey_screen.strip().lower()),
+        ("HOTKEY_WEB", config.hotkey_web.strip().lower()),
+        ("HOTKEY_CAPTURE", config.hotkey_capture.strip().lower()),
         ("OVERLAY_OPACITY", str(config.overlay_opacity)),
         ("OVERLAY_STEALTH", "true" if config.overlay_stealth else "false"),
         ("DASHBOARD_STEALTH", "true" if config.dashboard_stealth else "false"),

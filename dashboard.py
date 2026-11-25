@@ -541,7 +541,16 @@ class DashboardWindow(QWidget):
         candidate = self._collect_config_from_ui()
         if candidate == self._config:
             return
-        if self._validate_hotkey_pair(candidate.hotkey_answer, candidate.hotkey_toggle) is not None:
+        if (
+            self._validate_hotkey_pair(
+                candidate.hotkey_answer,
+                candidate.hotkey_toggle,
+                candidate.hotkey_screen,
+                candidate.hotkey_web,
+                candidate.hotkey_capture,
+            )
+            is not None
+        ):
             return
         if candidate.llm_provider == self._config.llm_provider or has_valid_llm_credentials(
             candidate
@@ -868,14 +877,17 @@ class DashboardWindow(QWidget):
 
         hk_card = self._make_card(page)
         hk_l = QVBoxLayout(hk_card)
-        hk_l.setContentsMargins(16, 12, 16, 12)
-        hk_l.setSpacing(8)
+        hk_l.setContentsMargins(16, 10, 16, 10)
+        hk_l.setSpacing(4)
         hk_title = QLabel("Гарячі клавіші", hk_card)
         hk_title.setObjectName("CardTitle")
         hk_l.addWidget(hk_title)
 
         self._hk_answer_pill = self._add_hotkey_row(hk_l, "Тезисна відповідь зараз")
         self._hk_toggle_pill = self._add_hotkey_row(hk_l, "Показати / сховати оверлей")
+        self._hk_capture_pill = self._add_hotkey_row(hk_l, "Старт / стоп сесії")
+        self._hk_screen_pill = self._add_hotkey_row(hk_l, "Зір екрана (👁)")
+        self._hk_web_pill = self._add_hotkey_row(hk_l, "Веб-пошук (🌐)")
 
         hk_tip = QLabel(
             "Гарячі клавіші працюють глобально незалежно від української чи англійської розкладки.",
@@ -1058,6 +1070,11 @@ class DashboardWindow(QWidget):
         self._live_deep_btn.clicked.connect(self.deep_answer_requested.emit)
         bottom_row.addWidget(self._live_deep_btn)
         layout.addLayout(bottom_row)
+
+        for btn in page.findChildren(QPushButton):
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
         return page
 
     # --- Page 2: Documents & Prompt ---
@@ -1498,6 +1515,18 @@ class DashboardWindow(QWidget):
         self._hk_toggle_edit.setPlaceholderText("ctrl+shift+h")
         form.addRow("Показати / сховати:", self._hk_toggle_edit)
 
+        self._hk_capture_edit = QLineEdit(tab)
+        self._hk_capture_edit.setPlaceholderText("ctrl+alt+r")
+        form.addRow("Старт / стоп сесії:", self._hk_capture_edit)
+
+        self._hk_screen_edit = QLineEdit(tab)
+        self._hk_screen_edit.setPlaceholderText("ctrl+alt+s")
+        form.addRow("Зір екрана (👁):", self._hk_screen_edit)
+
+        self._hk_web_edit = QLineEdit(tab)
+        self._hk_web_edit.setPlaceholderText("ctrl+alt+w")
+        form.addRow("Веб-пошук (🌐):", self._hk_web_edit)
+
         scroll.setWidget(tab)
         return scroll
 
@@ -1764,6 +1793,9 @@ class DashboardWindow(QWidget):
         self._ov_font_slider.setValue(int(round(cfg.overlay_font_scale * 100)))
         self._hk_answer_edit.setText(cfg.hotkey_answer)
         self._hk_toggle_edit.setText(cfg.hotkey_toggle)
+        self._hk_capture_edit.setText(cfg.hotkey_capture)
+        self._hk_screen_edit.setText(cfg.hotkey_screen)
+        self._hk_web_edit.setText(cfg.hotkey_web)
         self.vocab_edit.setText(cfg.custom_vocabulary)
         self.prompt_edit.setPlainText(cfg.system_prompt)
 
@@ -1786,6 +1818,10 @@ class DashboardWindow(QWidget):
 
         self._hk_answer_pill.setText(self._fmt_hotkey(cfg.hotkey_answer))
         self._hk_toggle_pill.setText(self._fmt_hotkey(cfg.hotkey_toggle))
+        self._hk_capture_pill.setText(self._fmt_hotkey(cfg.hotkey_capture))
+        self._hk_screen_pill.setText(self._fmt_hotkey(cfg.hotkey_screen))
+        self._hk_web_pill.setText(self._fmt_hotkey(cfg.hotkey_web))
+        self._refresh_live_toggle_tooltips(cfg)
 
     @staticmethod
     def _select_combo_by_data(combo: QComboBox, value: str) -> None:
@@ -1949,6 +1985,9 @@ class DashboardWindow(QWidget):
             overlay_font_scale=round(self._ov_font_slider.value() / 100.0, 2),
             hotkey_answer=self._hk_answer_edit.text().strip().lower() or "ctrl+space",
             hotkey_toggle=self._hk_toggle_edit.text().strip().lower() or "ctrl+shift+h",
+            hotkey_capture=self._hk_capture_edit.text().strip().lower() or "ctrl+alt+r",
+            hotkey_screen=self._hk_screen_edit.text().strip().lower() or "ctrl+alt+s",
+            hotkey_web=self._hk_web_edit.text().strip().lower() or "ctrl+alt+w",
             custom_vocabulary=self.vocab_edit.text().strip(),
             system_prompt=prompt_text,
             web_search_enabled=self._web_enabled_chk.isChecked(),
@@ -2178,10 +2217,40 @@ class DashboardWindow(QWidget):
             )
         )
 
+    def _refresh_live_toggle_tooltips(self, cfg: AppConfig | None = None) -> None:
+        ref = cfg or self._config
+        cap_tip = f"Запустити / зупинити прослуховування ({self._fmt_hotkey(ref.hotkey_capture)})"
+        self._home_start_btn.setToolTip(cap_tip)
+        self._live_start_btn.setToolTip(cap_tip)
+        self._live_web_btn.setToolTip(
+            f"Увімкнути / вимкнути пошук в інтернеті ({self._fmt_hotkey(ref.hotkey_web)})"
+        )
+        self._live_screen_btn.setToolTip(
+            f"Зір екрана: прикріплювати знімок екрана ({self._fmt_hotkey(ref.hotkey_screen)})"
+        )
+
     @staticmethod
-    def _validate_hotkey_pair(hk_answer: str, hk_toggle: str) -> str | None:
+    def _validate_hotkey_pair(
+        hk_answer: str,
+        hk_toggle: str,
+        hk_screen: str | None = None,
+        hk_web: str | None = None,
+        hk_capture: str | None = None,
+    ) -> str | None:
         modifiers = {"ctrl", "control", "alt", "shift", "win", "cmd", "super"}
-        for label, raw in (("Клавіша відповіді", hk_answer), ("Показати / сховати", hk_toggle)):
+        specs: list[tuple[str, str]] = [
+            ("Клавіша відповіді", hk_answer),
+            ("Показати / сховати", hk_toggle),
+        ]
+        if hk_capture is not None:
+            specs.append(("Старт / стоп сесії", hk_capture))
+        if hk_screen is not None:
+            specs.append(("Зір екрана", hk_screen))
+        if hk_web is not None:
+            specs.append(("Веб-пошук", hk_web))
+
+        seen: dict[str, str] = {}
+        for label, raw in specs:
             spec = raw.strip().lower()
             if not spec or not spec.isascii():
                 return f"{label}: використовуйте латинські клавіші, наприклад ctrl+space."
@@ -2189,15 +2258,21 @@ class DashboardWindow(QWidget):
             non_mods = [p for p in parts if p not in modifiers]
             if len(parts) < 2 or len(non_mods) != 1:
                 return f"{label}: вкажіть модифікатор + 1 клавішу (напр. ctrl+space)."
-        norm_a = "+".join(p.strip().strip("<>").lower() for p in hk_answer.split("+") if p.strip())
-        norm_t = "+".join(p.strip().strip("<>").lower() for p in hk_toggle.split("+") if p.strip())
-        if norm_a == norm_t:
-            return "Гарячі клавіші відповіді та приховування не можуть збігатися."
+            norm = "+".join(parts)
+            if norm in seen:
+                return f"Гарячі клавіші «{seen[norm]}» та «{label}» не можуть збігатися."
+            seen[norm] = label
         return None
 
     def _on_save_settings_clicked(self) -> None:
         new_cfg = self._collect_config_from_ui()
-        hotkey_err = self._validate_hotkey_pair(new_cfg.hotkey_answer, new_cfg.hotkey_toggle)
+        hotkey_err = self._validate_hotkey_pair(
+            new_cfg.hotkey_answer,
+            new_cfg.hotkey_toggle,
+            new_cfg.hotkey_screen,
+            new_cfg.hotkey_web,
+            new_cfg.hotkey_capture,
+        )
         if hotkey_err:
             self.show_settings_error(hotkey_err)
             return
@@ -2214,6 +2289,10 @@ class DashboardWindow(QWidget):
         self._sync_live_screen_btn(new_cfg.screen_vision_enabled)
         self._hk_answer_pill.setText(self._fmt_hotkey(new_cfg.hotkey_answer))
         self._hk_toggle_pill.setText(self._fmt_hotkey(new_cfg.hotkey_toggle))
+        self._hk_capture_pill.setText(self._fmt_hotkey(new_cfg.hotkey_capture))
+        self._hk_screen_pill.setText(self._fmt_hotkey(new_cfg.hotkey_screen))
+        self._hk_web_pill.setText(self._fmt_hotkey(new_cfg.hotkey_web))
+        self._refresh_live_toggle_tooltips(new_cfg)
         self._save_status_lbl.setStyleSheet("color: #4ADE80;")
         self._save_status_lbl.setText("Налаштування збережено та застосовано.")
         self.refresh_readiness()

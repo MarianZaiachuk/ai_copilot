@@ -1,5 +1,5 @@
 #define MyAppName "AI Copilot"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.1"
 #define MyAppPublisher "MarianZaiachuk"
 #define MyAppURL "https://github.com/MarianZaiachuk/ai_copilot"
 #define MyAppExeName "ZoomAICopilot.exe"

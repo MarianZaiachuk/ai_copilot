@@ -574,6 +574,13 @@ def apply_window_display_affinity(hwnd: int, exclude_from_capture: bool) -> bool
         return False
 
 
+def _disable_button_focus(btn: QPushButton) -> None:
+    """Prevent QPushButton from stealing keyboard focus or triggering on Space/Enter."""
+    btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    btn.setAutoDefault(False)
+    btn.setDefault(False)
+
+
 class CopilotOverlayWindow(QWidget):
     """Translucent always-on-top stealth overlay with Compact Answer Card and Expanded Split modes."""
 
@@ -610,10 +617,16 @@ class CopilotOverlayWindow(QWidget):
         screen_vision_enabled: bool = False,
         app_icon: QIcon | None = None,
         parent: QWidget | None = None,
+        hotkey_screen_label: str = "Ctrl+Alt+S",
+        hotkey_web_label: str = "Ctrl+Alt+W",
+        hotkey_capture_label: str = "Ctrl+Alt+R",
     ) -> None:
         super().__init__(parent)
         self._hotkey_answer_label = hotkey_answer_label
         self._hotkey_toggle_label = hotkey_toggle_label
+        self._hotkey_screen_label = hotkey_screen_label
+        self._hotkey_web_label = hotkey_web_label
+        self._hotkey_capture_label = hotkey_capture_label
 
         self._stealth_enabled = bool(stealth_enabled)
         self._stealth_applied = False
@@ -845,6 +858,9 @@ class CopilotOverlayWindow(QWidget):
         self._capture_btn = QPushButton("▶ Старт", self._toolbar_widget)
         self._capture_btn.setObjectName("CaptureButton")
         self._capture_btn.setProperty("capturing", "false")
+        self._capture_btn.setToolTip(
+            f"Запуск / зупинка прослуховування звуку ({self._hotkey_capture_label})"
+        )
         self._capture_btn.clicked.connect(self._on_capture_clicked)
         toolbar.addWidget(self._capture_btn)
 
@@ -1039,6 +1055,8 @@ class CopilotOverlayWindow(QWidget):
         for target in (self._root, self._title_bar, self._body):
             if target is not None:
                 target.installEventFilter(self)
+        for btn in self.findChildren(QPushButton):
+            _disable_button_focus(btn)
 
     # --- Compact / Expanded layout ---
 
@@ -1096,16 +1114,34 @@ class CopilotOverlayWindow(QWidget):
             QTimer.singleShot(0, self._reapply_stealth_if_visible)
         self.expanded_changed.emit(self._expanded)
 
-    def set_hotkey_labels(self, answer_label: str, toggle_label: str) -> None:
+    def set_hotkey_labels(
+        self,
+        answer_label: str,
+        toggle_label: str,
+        screen_label: str | None = None,
+        web_label: str | None = None,
+        capture_label: str | None = None,
+    ) -> None:
         self._hotkey_answer_label = answer_label
         self._hotkey_toggle_label = toggle_label
+        if screen_label is not None:
+            self._hotkey_screen_label = screen_label
+        if web_label is not None:
+            self._hotkey_web_label = web_label
+        if capture_label is not None:
+            self._hotkey_capture_label = capture_label
         self._hide_btn.setToolTip(f"Сховати оверлей ({toggle_label})")
+        self._capture_btn.setToolTip(
+            f"Запуск / зупинка прослуховування звуку ({self._hotkey_capture_label})"
+        )
         self._hotkeys_label.setText(
-            f"{answer_label} — відповідь | {toggle_label} — сховати"
+            f"{answer_label} — відповідь | {toggle_label} — сховати | {self._hotkey_screen_label} — екран"
         )
         self.answer_browser.setPlaceholderText(
             f"Натисніть {answer_label} або ↵ для миттєвої тезисної відповіді..."
         )
+        self.set_web_search_enabled(self._web_search_enabled)
+        self.set_screen_vision_enabled(self._screen_vision_enabled)
         self._apply_generating_ui(self._is_generating)
 
     def set_font_scale(self, scale: float) -> None:
@@ -1398,7 +1434,7 @@ class CopilotOverlayWindow(QWidget):
         self._refresh_web_btn_label()
         state_desc = "увімкнено" if self._web_search_enabled else "вимкнено"
         self._web_search_btn.setToolTip(
-            f"Веб-пошук та AI-агент ({state_desc}): дозволити пошук в інтернеті"
+            f"Веб-пошук та AI-агент ({state_desc}, {self._hotkey_web_label}): дозволити пошук в інтернеті"
         )
 
     def _refresh_screen_btn_label(self) -> None:
@@ -1424,7 +1460,7 @@ class CopilotOverlayWindow(QWidget):
         self._refresh_screen_btn_label()
         state_desc = "увімкнено" if self._screen_vision_enabled else "вимкнено"
         self._screen_vision_btn.setToolTip(
-            f"Зір екрана ({state_desc}): агент бачить код і слайди на вашому екрані"
+            f"Зір екрана ({state_desc}, {self._hotkey_screen_label}): агент бачить код і слайди на вашому екрані"
         )
 
     def toggle_visibility(self) -> None:

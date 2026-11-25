@@ -92,6 +92,11 @@ def test_atomic_env_save_and_load_roundtrip(tmp_path: Path, monkeypatch) -> None
         "SCREEN_VISION_ENABLED",
         "SCREEN_CAPTURE_INDEX",
         "SCREEN_CAPTURE_MAX_WIDTH",
+        "HOTKEY_ANSWER",
+        "HOTKEY_TOGGLE",
+        "HOTKEY_SCREEN",
+        "HOTKEY_WEB",
+        "HOTKEY_CAPTURE",
         "STT_PROVIDER",
         "STT_API_KEY",
         "STT_MODEL",
@@ -127,6 +132,9 @@ def test_atomic_env_save_and_load_roundtrip(tmp_path: Path, monkeypatch) -> None
         screen_vision_enabled=True,
         screen_capture_index=1,
         screen_capture_max_width=1280,
+        hotkey_screen="ctrl+alt+e",
+        hotkey_web="ctrl+alt+f",
+        hotkey_capture="ctrl+alt+p",
         system_prompt='Рядок 1: "тест"\nРядок 2: #коментар',
     )
     saved = config.save_config_to_env(original, env_file)
@@ -156,6 +164,9 @@ def test_atomic_env_save_and_load_roundtrip(tmp_path: Path, monkeypatch) -> None
     assert loaded.screen_vision_enabled is True
     assert loaded.screen_capture_index == 1
     assert loaded.screen_capture_max_width == 1280
+    assert loaded.hotkey_screen == "ctrl+alt+e"
+    assert loaded.hotkey_web == "ctrl+alt+f"
+    assert loaded.hotkey_capture == "ctrl+alt+p"
     assert loaded.stt_provider == "deepgram"
     assert loaded.stt_api_key == "dg-secret-key-roundtrip-987654"
     assert loaded.stt_model == "nova-3"

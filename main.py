@@ -305,34 +305,85 @@ class GlobalHotkeyBridge(QObject):
 
     answer_hotkey_pressed = pyqtSignal()
     toggle_hotkey_pressed = pyqtSignal()
+    screen_hotkey_pressed = pyqtSignal()
+    web_hotkey_pressed = pyqtSignal()
+    capture_hotkey_pressed = pyqtSignal()
 
     def __init__(
         self,
         answer_spec: str,
         toggle_spec: str,
+        screen_spec: str = "ctrl+alt+s",
+        web_spec: str = "ctrl+alt+w",
+        capture_spec: str = "ctrl+alt+r",
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
-        ans = parse_hotkey_spec(answer_spec)
-        tog = parse_hotkey_spec(toggle_spec)
-        if ans == tog:
-            raise ValueError("Гарячі клавіші відповіді та приховування не можуть збігатися")
-        self._answer_combo = ans
-        self._toggle_combo = tog
+        combos = self._parse_and_check_unique(
+            answer_spec=answer_spec,
+            toggle_spec=toggle_spec,
+            screen_spec=screen_spec,
+            web_spec=web_spec,
+            capture_spec=capture_spec,
+        )
+        (
+            self._answer_combo,
+            self._toggle_combo,
+            self._screen_combo,
+            self._web_combo,
+            self._capture_combo,
+        ) = combos
 
         self._lock = threading.Lock()
         self._pressed_modifiers: set[str] = set()
         self._fired_vks: set[int] = set()
         self._listener: keyboard.Listener | None = None
 
-    def update_hotkeys(self, answer_spec: str, toggle_spec: str) -> None:
+    @staticmethod
+    def _parse_and_check_unique(
+        *,
+        answer_spec: str,
+        toggle_spec: str,
+        screen_spec: str,
+        web_spec: str,
+        capture_spec: str,
+    ) -> tuple[
+        tuple[frozenset[str], int],
+        tuple[frozenset[str], int],
+        tuple[frozenset[str], int],
+        tuple[frozenset[str], int],
+        tuple[frozenset[str], int],
+    ]:
+        ans = parse_hotkey_spec(answer_spec)
+        tog = parse_hotkey_spec(toggle_spec)
+        scr = parse_hotkey_spec(screen_spec)
+        web = parse_hotkey_spec(web_spec)
+        cap = parse_hotkey_spec(capture_spec)
+        if len({ans, tog, scr, web, cap}) < 5:
+            raise ValueError("Гарячі клавіші не можуть збігатися")
+        return ans, tog, scr, web, cap
+
+    def update_hotkeys(
+        self,
+        answer_spec: str,
+        toggle_spec: str,
+        screen_spec: str | None = None,
+        web_spec: str | None = None,
+        capture_spec: str | None = None,
+    ) -> None:
         new_ans = parse_hotkey_spec(answer_spec)
         new_tog = parse_hotkey_spec(toggle_spec)
-        if new_ans == new_tog:
-            raise ValueError("Гарячі клавіші відповіді та приховування не можуть збігатися")
+        new_scr = parse_hotkey_spec(screen_spec) if screen_spec is not None else self._screen_combo
+        new_web = parse_hotkey_spec(web_spec) if web_spec is not None else self._web_combo
+        new_cap = parse_hotkey_spec(capture_spec) if capture_spec is not None else self._capture_combo
+        if len({new_ans, new_tog, new_scr, new_web, new_cap}) < 5:
+            raise ValueError("Гарячі клавіші не можуть збігатися")
         with self._lock:
             self._answer_combo = new_ans
             self._toggle_combo = new_tog
+            self._screen_combo = new_scr
+            self._web_combo = new_web
+            self._capture_combo = new_cap
             self._fired_vks.clear()
 
     def start(self) -> None:
@@ -454,6 +505,15 @@ class GlobalHotkeyBridge(QObject):
             elif (current_mods, vk) == self._toggle_combo:
                 self._fired_vks.add(vk)
                 pending_signal = self.toggle_hotkey_pressed
+            elif (current_mods, vk) == self._screen_combo:
+                self._fired_vks.add(vk)
+                pending_signal = self.screen_hotkey_pressed
+            elif (current_mods, vk) == self._web_combo:
+                self._fired_vks.add(vk)
+                pending_signal = self.web_hotkey_pressed
+            elif (current_mods, vk) == self._capture_combo:
+                self._fired_vks.add(vk)
+                pending_signal = self.capture_hotkey_pressed
 
         if pending_signal is not None:
             pending_signal.emit()
@@ -1162,10 +1222,16 @@ class CopilotController(QObject):
         self._hotkey_bridge = GlobalHotkeyBridge(
             answer_spec=self.config.hotkey_answer,
             toggle_spec=self.config.hotkey_toggle,
+            screen_spec=self.config.hotkey_screen,
+            web_spec=self.config.hotkey_web,
+            capture_spec=self.config.hotkey_capture,
             parent=self,
         )
         self._hotkey_bridge.answer_hotkey_pressed.connect(self._on_answer_hotkey)
         self._hotkey_bridge.toggle_hotkey_pressed.connect(self.overlay.toggle_visibility)
+        self._hotkey_bridge.screen_hotkey_pressed.connect(self.toggle_screen_vision)
+        self._hotkey_bridge.web_hotkey_pressed.connect(self.toggle_web_search)
+        self._hotkey_bridge.capture_hotkey_pressed.connect(self.toggle_capture)
 
         self._tray_icon: QSystemTrayIcon | None = None
         self._tray_menu: QMenu | None = None
@@ -1406,6 +1472,32 @@ class CopilotController(QObject):
         self.overlay.set_screen_vision_enabled(state)
         self.dashboard.set_screen_vision_enabled(state)
         self._sync_tray_check_states()
+
+    def toggle_screen_vision(self) -> None:
+        """Toggle Screen Vision via global hotkey and display brief status feedback."""
+        new_state = not bool(self.config.screen_vision_enabled)
+        self.set_screen_vision_enabled(new_state)
+        self.overlay.set_answer_provenance(
+            "👁 Зір екрана: УВІМКНЕНО" if new_state else "👁 Зір екрана: ВИМКНЕНО"
+        )
+
+    def toggle_web_search(self) -> None:
+        """Toggle Web Search via global hotkey and display brief status feedback."""
+        new_state = not bool(self.config.web_search_enabled)
+        self.set_web_search_enabled(new_state)
+        self.overlay.set_answer_provenance(
+            "🌐 Веб-пошук: УВІМКНЕНО" if new_state else "🌐 Веб-пошук: ВИМКНЕНО"
+        )
+
+    def toggle_capture(self) -> None:
+        """Start or stop audio session capture via global hotkey."""
+        if self._is_capturing:
+            self.stop_capture()
+            self.overlay.set_answer_provenance("⏹ Сесію зупинено")
+            return
+        dev_idx = self.dashboard.home_device_combo.currentData()
+        self.start_capture(int(dev_idx) if dev_idx is not None else -1)
+        self.overlay.set_answer_provenance("🎙 Сесію запущено")
 
     def test_screen_capture(self, screen_index: int, max_width: int = -1) -> None:
         """Capture a test screenshot and display resolution, size, and latency."""
@@ -2213,6 +2305,21 @@ class CopilotController(QObject):
         if self._shutting_down or req_id != self._active_request_id:
             return
         self._live_render_timer.stop()
+        if not self._live_answer_buffer.strip():
+            msg = (
+                "Модель завершила генерацію без тексту відповіді. "
+                "Перевірте обрану модель або вимкніть «👁 Екран» для чисто текстових моделей."
+            )
+            self.overlay.show_answer_error(msg)
+            self.overlay.set_answer_provenance(f"Порожня відповідь ({self.llm_client.provider_display_name()})")
+            self.dashboard.set_generating(False)
+            self.dashboard.set_live_answer_markdown(f"**Помилка:**\n\n- {msg}")
+            if 0 <= self._qa_index < len(self._qa_history) and not self._qa_history[self._qa_index].answer:
+                self._qa_history.pop(self._qa_index)
+                self._qa_index = len(self._qa_history) - 1
+            self._sync_qa_nav()
+            return
+
         self._live_answer_dirty = True
         self._flush_dashboard_answer()
         self.overlay.finish_answer_stream()
@@ -2328,6 +2435,9 @@ class CopilotController(QObject):
             self._hotkey_bridge.update_hotkeys(
                 new_config.hotkey_answer,
                 new_config.hotkey_toggle,
+                new_config.hotkey_screen,
+                new_config.hotkey_web,
+                new_config.hotkey_capture,
             )
         except ValueError as exc:
             self.dashboard.show_settings_error(f"Помилка гарячої клавіші: {exc}")
@@ -2389,6 +2499,9 @@ class CopilotController(QObject):
         self.overlay.set_hotkey_labels(
             format_hotkey_label(new_config.hotkey_answer),
             format_hotkey_label(new_config.hotkey_toggle),
+            format_hotkey_label(new_config.hotkey_screen),
+            format_hotkey_label(new_config.hotkey_web),
+            format_hotkey_label(new_config.hotkey_capture),
         )
         self.overlay.set_answer_provenance(self.llm_client.provider_display_name())
 
@@ -2697,6 +2810,9 @@ def main() -> int:
     overlay = CopilotOverlayWindow(
         hotkey_answer_label=format_hotkey_label(config.hotkey_answer),
         hotkey_toggle_label=format_hotkey_label(config.hotkey_toggle),
+        hotkey_screen_label=format_hotkey_label(config.hotkey_screen),
+        hotkey_web_label=format_hotkey_label(config.hotkey_web),
+        hotkey_capture_label=format_hotkey_label(config.hotkey_capture),
         stealth_enabled=config.overlay_stealth,
         opacity_percent=config.overlay_opacity,
         font_scale=config.overlay_font_scale,

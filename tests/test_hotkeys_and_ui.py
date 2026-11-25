@@ -19,12 +19,27 @@ import ui
 def test_parse_hotkey_spec_and_bridge_debounce() -> None:
     assert app_main.parse_hotkey_spec("ctrl+space") == (frozenset({"ctrl"}), 0x20)
     assert app_main.parse_hotkey_spec("ctrl+shift+h") == (frozenset({"ctrl", "shift"}), 0x48)
+    assert app_main.parse_hotkey_spec("ctrl+alt+s") == (frozenset({"ctrl", "alt"}), 0x53)
+    assert app_main.parse_hotkey_spec("ctrl+alt+w") == (frozenset({"ctrl", "alt"}), 0x57)
+    assert app_main.parse_hotkey_spec("ctrl+alt+r") == (frozenset({"ctrl", "alt"}), 0x52)
 
-    bridge = app_main.GlobalHotkeyBridge("ctrl+space", "ctrl+shift+h")
+    bridge = app_main.GlobalHotkeyBridge(
+        "ctrl+space",
+        "ctrl+shift+h",
+        screen_spec="ctrl+alt+s",
+        web_spec="ctrl+alt+w",
+        capture_spec="ctrl+alt+r",
+    )
     ans_calls = []
     tog_calls = []
+    scr_calls = []
+    web_calls = []
+    cap_calls = []
     bridge.answer_hotkey_pressed.connect(lambda: ans_calls.append(1))
     bridge.toggle_hotkey_pressed.connect(lambda: tog_calls.append(1))
+    bridge.screen_hotkey_pressed.connect(lambda: scr_calls.append(1))
+    bridge.web_hotkey_pressed.connect(lambda: web_calls.append(1))
+    bridge.capture_hotkey_pressed.connect(lambda: cap_calls.append(1))
 
     # Simulated Ukrainian layout KeyCode for H key (vk=0x48, char='р')
     uk_h_key = SimpleNamespace(vk=0x48, char="р")
@@ -38,6 +53,21 @@ def test_parse_hotkey_spec_and_bridge_debounce() -> None:
     bridge._on_release(keyboard.Key.shift_l)
     bridge._on_press(keyboard.Key.space)
     assert len(ans_calls) == 1
+
+    # Simulated Ukrainian layout KeyCodes for S (і), W (ц), and R (к) with Ctrl+Alt
+    bridge._on_release(keyboard.Key.space)
+    bridge._on_press(keyboard.Key.alt_l)
+    uk_s_key = SimpleNamespace(vk=0x53, char="і")
+    uk_w_key = SimpleNamespace(vk=0x57, char="ц")
+    uk_r_key = SimpleNamespace(vk=0x52, char="к")
+    bridge._on_press(uk_s_key)
+    assert len(scr_calls) == 1
+    bridge._on_release(uk_s_key)
+    bridge._on_press(uk_w_key)
+    assert len(web_calls) == 1
+    bridge._on_release(uk_w_key)
+    bridge._on_press(uk_r_key)
+    assert len(cap_calls) == 1
 
 
 def test_overlay_and_dashboard_ui_integration() -> None:
@@ -447,6 +477,41 @@ def test_stealth_locked_everywhere_except_settings_warning(monkeypatch) -> None:
     assert len(warn_calls) == 4
     assert dash._ov_stealth_chk.isChecked() is True
     assert len(saved_cfgs) == 3 and saved_cfgs[-1].overlay_stealth is True
+
+    ov.close()
+    dash.force_close()
+    app.processEvents()
+
+
+def test_buttons_never_steal_focus_from_manual_input_on_enter_or_space() -> None:
+    from PyQt6.QtCore import Qt
+
+    app = QApplication.instance() or QApplication([])
+    ov = ui.CopilotOverlayWindow(screen_vision_enabled=True, web_search_enabled=True)
+    dash = dashboard.DashboardWindow(
+        config=config.AppConfig(
+            llm_provider="cerebras",
+            cerebras_api_key="csk-focus-test-1234567890",
+            screen_vision_enabled=True,
+            web_search_enabled=True,
+        )
+    )
+    assert ov._screen_vision_btn.focusPolicy() == Qt.FocusPolicy.NoFocus
+    assert ov._web_search_btn.focusPolicy() == Qt.FocusPolicy.NoFocus
+    assert ov._screen_vision_btn.autoDefault() is False
+    assert dash._live_screen_btn.focusPolicy() == Qt.FocusPolicy.NoFocus
+    assert dash._live_web_btn.focusPolicy() == Qt.FocusPolicy.NoFocus
+
+    ov.show()
+    ov.manual_input.setFocus()
+    ov.manual_input.setText("Що зараз на екрані?")
+    submitted: list[tuple[str, str]] = []
+    ov.answer_requested.connect(lambda m, s: submitted.append((m, s)))
+
+    ov.manual_input.returnPressed.emit()
+    assert submitted == [("Що зараз на екрані?", "")]
+    assert ov.screen_vision_enabled is True
+    assert ov.web_search_enabled is True
 
     ov.close()
     dash.force_close()

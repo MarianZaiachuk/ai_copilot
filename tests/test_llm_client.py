@@ -41,6 +41,9 @@ def test_2026_defaults_and_xml_delimited_prompts() -> None:
     detailed = llm_client.build_user_prompt("Що таке WASAPI?", detail_mode="detailed")
     assert "detailed" in detailed
     assert "<documents_context>" not in detailed
+    assert "VERY LAST" in concise
+    assert "visual graph" in llm_client._GROUNDING_BOUNDARY_RULE
+    assert "графік" in llm_client._SCREEN_VISION_RULE
 
 
 def test_list_available_models_filtering_for_gemini_and_groq() -> None:
@@ -322,3 +325,67 @@ def test_cerebras_provider_settings_sorting_and_redaction() -> None:
     masked = redact_secrets("Authorization: csk-1234567890abcdef")
     assert "csk-1234567890abcdef" not in masked
     assert "***REDACTED***" in masked
+
+
+def test_cerebras_reasoning_budget_vision_routing_and_empty_retry() -> None:
+    # 1. qwen-3.8-27b in concise mode disables reasoning tokens; gpt-oss-120b uses low/hidden + boosted max_tokens
+    assert llm_client._groq_reasoning_extra_body("cerebras", "qwen-3.8-27b", "concise") == {
+        "reasoning_effort": "none"
+    }
+    oss_extra = llm_client._groq_reasoning_extra_body("cerebras", "gpt-oss-120b", "concise")
+    assert oss_extra == {"reasoning_effort": "low", "reasoning_format": "hidden"}
+    assert llm_client._effective_max_tokens(512, oss_extra) == 1200
+
+    # 2. Cerebras text-only gpt-oss-120b auto-routes to qwen-3.8-27b when screen image is attached
+    fake_oai = MagicMock()
+    captured_models: list[str] = []
+    captured_max_tokens: list[int] = []
+
+    def _fake_create(**kwargs):
+        captured_models.append(kwargs["model"])
+        captured_max_tokens.append(kwargs["max_tokens"])
+        return iter(
+            [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="- Бачу код"))])]
+        )
+
+    fake_oai.chat.completions.create.side_effect = _fake_create
+    cfg_oss = config.AppConfig(
+        llm_provider="cerebras",
+        cerebras_api_key="csk-test1234567890abcd",
+        cerebras_model="gpt-oss-120b",
+    )
+    with patch.object(llm_client, "OpenAI", return_value=fake_oai):
+        client = llm_client.LLMClient(cfg_oss)
+        chunks = list(
+            client.stream_answer(
+                "",
+                manual_question="Що на екрані?",
+                screen_image_bytes=b"\xff\xd8\xff\xe0fakejpg",
+                screen_image_mime="image/jpeg",
+            )
+        )
+    assert chunks == ["- Бачу код"]
+    assert captured_models == ["qwen-3.8-27b"]
+
+    # 3. Empty stream triggers one retry with boosted max_tokens, then raises clear RuntimeError if still empty
+    fake_oai_empty = MagicMock()
+    retry_tokens: list[int] = []
+
+    def _empty_create(**kwargs):
+        retry_tokens.append(kwargs["max_tokens"])
+        return iter(
+            [SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=None))])]
+        )
+
+    fake_oai_empty.chat.completions.create.side_effect = _empty_create
+    cfg_qwen = config.AppConfig(
+        llm_provider="cerebras",
+        cerebras_api_key="csk-test1234567890abcd",
+        cerebras_model="qwen-3.8-27b",
+        llm_max_tokens=512,
+    )
+    with patch.object(llm_client, "OpenAI", return_value=fake_oai_empty):
+        client_q = llm_client.LLMClient(cfg_qwen)
+        with pytest.raises(RuntimeError, match="порожню відповідь"):
+            list(client_q.stream_answer("Що на екрані?"))
+    assert retry_tokens == [512, 1536]
