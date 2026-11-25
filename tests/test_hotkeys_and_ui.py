@@ -227,10 +227,14 @@ def test_polish_ui_stop_nav_validation_markdown_and_icons() -> None:
     dash = dashboard.DashboardWindow(config=cfg)
     ov = ui.CopilotOverlayWindow()
 
-    # Compact title bar fits <= 430px & Dashboard fits <= 840x560
+    # Compact title bar fits <= 430px & Dashboard fits <= 840x560 (even on fresh setup without API keys)
     assert ov._title_bar.minimumSizeHint().width() <= 430
     dash_min = dash.minimumSizeHint()
     assert dash_min.width() <= 840 and dash_min.height() <= 560
+    dash_fresh = dashboard.DashboardWindow(config=config.AppConfig())
+    dash_fresh_min = dash_fresh.minimumSizeHint()
+    dash_fresh.force_close()
+    assert dash_fresh_min.width() <= 840 and dash_fresh_min.height() <= 560
 
     # Stop toggle emits cancel_answer_requested rather than answer_requested while generating
     cancels: list[int] = []

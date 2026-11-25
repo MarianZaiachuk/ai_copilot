@@ -725,14 +725,14 @@ class DashboardWindow(QWidget):
     def _build_home_page(self) -> QWidget:
         page = QWidget(self)
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(8)
 
         # First-run setup banner
         self._setup_banner = QFrame(page)
         self._setup_banner.setObjectName("SetupBanner")
         banner_l = QHBoxLayout(self._setup_banner)
-        banner_l.setContentsMargins(14, 10, 14, 10)
+        banner_l.setContentsMargins(12, 7, 12, 7)
         banner_txt = QLabel(
             "Потрібно налаштувати LLM: додайте API-ключ (OpenAI / Groq / Gemini) або оберіть локальну Ollama.",
             self._setup_banner,
@@ -807,8 +807,8 @@ class DashboardWindow(QWidget):
         # Readiness Checklist card
         ready_card = self._make_card(page)
         ready_l = QVBoxLayout(ready_card)
-        ready_l.setContentsMargins(16, 14, 16, 14)
-        ready_l.setSpacing(7)
+        ready_l.setContentsMargins(14, 10, 14, 10)
+        ready_l.setSpacing(5)
 
         r_title = QLabel("Стан готовності", ready_card)
         r_title.setObjectName("CardTitle")
@@ -877,8 +877,8 @@ class DashboardWindow(QWidget):
 
         hk_card = self._make_card(page)
         hk_l = QVBoxLayout(hk_card)
-        hk_l.setContentsMargins(16, 10, 16, 10)
-        hk_l.setSpacing(4)
+        hk_l.setContentsMargins(14, 8, 14, 8)
+        hk_l.setSpacing(3)
         hk_title = QLabel("Гарячі клавіші", hk_card)
         hk_title.setObjectName("CardTitle")
         hk_l.addWidget(hk_title)
