@@ -71,13 +71,33 @@ def get_resource_path(rel_path: str) -> Path:
     return get_app_dir() / rel_path
 
 
+def is_dir_writable(path: Path) -> bool:
+    """Return True if files can actually be created and removed inside `path`."""
+    try:
+        target = Path(path)
+        if not target.is_dir():
+            return False
+        with tempfile.NamedTemporaryFile(
+            dir=target, prefix=".write_probe_", delete=True
+        ):
+            pass
+        return True
+    except OSError:
+        return False
+
+
 def get_env_file_path() -> Path:
     """Return writable `.env` path next to app/exe, falling back to %APPDATA% if needed."""
-    app_env = get_app_dir() / ".env"
+    app_dir = get_app_dir()
+    app_env = app_dir / ".env"
     if app_env.is_file():
-        if os.access(app_env, os.W_OK):
+        try:
+            with app_env.open("a", encoding="utf-8"):
+                pass
             return app_env
-    elif os.access(get_app_dir(), os.W_OK):
+        except OSError:
+            pass
+    elif is_dir_writable(app_dir):
         return app_env
 
     appdata_dir = Path(os.getenv("APPDATA", str(Path.home()))) / "ZoomAICopilot"

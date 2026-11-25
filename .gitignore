@@ -10,7 +10,9 @@ __pycache__/
 
 # PyInstaller / build artifacts
 build/
+build_lite/
 dist/
+dist_lite/
 release/
 *.exe
 *.lnk

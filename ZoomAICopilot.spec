@@ -1,9 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller specification for ZoomAICopilot (--onedir with NVIDIA CUDA 12 / cuDNN DLLs)."""
 
+import os
 from pathlib import Path
 import site
 import sys
+
+IS_LITE_BUILD = os.getenv("ZOOM_COPILOT_LITE", "").strip().lower() in {"1", "true", "yes"}
 
 from PyInstaller.utils.hooks import (
     collect_data_files,
@@ -27,33 +30,34 @@ binaries += collect_dynamic_libs("ctranslate2")
 binaries += collect_dynamic_libs("onnxruntime")
 binaries += collect_dynamic_libs("primp")
 
-# Collect required NVIDIA cuBLAS / cuDNN 9 / CUDA NVRTC DLLs into _internal/nvidia/<pkg>/bin
-NVIDIA_ALLOWED_PKGS = {"cublas", "cudnn", "cuda_runtime", "cuda_nvrtc"}
-seen_sp = set()
-site_roots = []
-for sp in list(site.getsitepackages()) + [str(Path(sys.prefix) / "Lib" / "site-packages")]:
-    p = Path(sp)
-    key = str(p).lower()
-    if key not in seen_sp and p.is_dir():
-        seen_sp.add(key)
-        site_roots.append(p)
+# Collect required NVIDIA cuBLAS / cuDNN 9 / CUDA NVRTC DLLs into _internal/nvidia/<pkg>/bin (Full build only)
+if not IS_LITE_BUILD:
+    NVIDIA_ALLOWED_PKGS = {"cublas", "cudnn", "cuda_runtime", "cuda_nvrtc"}
+    seen_sp = set()
+    site_roots = []
+    for sp in list(site.getsitepackages()) + [str(Path(sys.prefix) / "Lib" / "site-packages")]:
+        p = Path(sp)
+        key = str(p).lower()
+        if key not in seen_sp and p.is_dir():
+            seen_sp.add(key)
+            site_roots.append(p)
 
-for sp_root in site_roots:
-    nvidia_dir = sp_root / "nvidia"
-    if not nvidia_dir.is_dir():
-        continue
-    for pkg_dir in sorted(nvidia_dir.iterdir()):
-        if pkg_dir.name not in NVIDIA_ALLOWED_PKGS:
+    for sp_root in site_roots:
+        nvidia_dir = sp_root / "nvidia"
+        if not nvidia_dir.is_dir():
             continue
-        bin_dir = pkg_dir / "bin"
-        if not bin_dir.is_dir():
-            continue
-        dest_rel = f"nvidia/{pkg_dir.name}/bin"
-        for dll in bin_dir.glob("*.dll"):
-            low_name = dll.name.lower()
-            if low_name.endswith(".alt.dll") or low_name.startswith("nvblas64_"):
+        for pkg_dir in sorted(nvidia_dir.iterdir()):
+            if pkg_dir.name not in NVIDIA_ALLOWED_PKGS:
                 continue
-            binaries.append((str(dll), dest_rel))
+            bin_dir = pkg_dir / "bin"
+            if not bin_dir.is_dir():
+                continue
+            dest_rel = f"nvidia/{pkg_dir.name}/bin"
+            for dll in bin_dir.glob("*.dll"):
+                low_name = dll.name.lower()
+                if low_name.endswith(".alt.dll") or low_name.startswith("nvblas64_"):
+                    continue
+                binaries.append((str(dll), dest_rel))
 
 hiddenimports = (
     [

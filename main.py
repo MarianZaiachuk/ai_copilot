@@ -24,6 +24,7 @@ from config import (
     PromptProfile,
     get_app_dir,
     get_resource_path,
+    is_dir_writable,
     load_config,
     parse_custom_vocabulary,
     register_cuda_dlls,
@@ -88,7 +89,7 @@ class WindowsSingleInstanceGuard:
 def _get_runtime_data_dir() -> Path:
     """Return writable directory for logs and runtime state (AppDir or %APPDATA%)."""
     app_dir = get_app_dir()
-    if os.access(app_dir, os.W_OK):
+    if is_dir_writable(app_dir):
         return app_dir
     appdata_dir = Path(os.getenv("APPDATA", str(Path.home()))) / "ZoomAICopilot"
     appdata_dir.mkdir(parents=True, exist_ok=True)
@@ -137,8 +138,25 @@ class _LoggingStdStream(io.TextIOBase):
             self._logger.log(self._level, "%s", redact_secrets(cleaned))
 
 
+_LOG_FILE_PATH: Path | None = None
+
+
+def _show_startup_message(title: str, message: str, *, is_error: bool = True) -> None:
+    """Show a native Win32 dialog during early startup/crash before Qt event loop."""
+    if sys.platform != "win32" or os.getenv("PYTEST_CURRENT_TEST"):
+        return
+    if "--smoke-test" in sys.argv:
+        return
+    try:
+        flags = 0x10 if is_error else 0x40  # MB_ICONERROR / MB_ICONINFORMATION
+        ctypes.windll.user32.MessageBoxW(None, str(message), str(title), flags)
+    except Exception:
+        pass
+
+
 def _setup_logging_and_streams() -> None:
     """Configure rotating secret-redacting logging and guard None stdout/stderr in .exe."""
+    global _LOG_FILE_PATH
     data_dir = _get_runtime_data_dir()
     log_path = data_dir / "copilot.log"
 
@@ -163,6 +181,7 @@ def _setup_logging_and_streams() -> None:
             file_handler.setFormatter(formatter)
             file_handler.addFilter(secret_filter)
             handlers.append(file_handler)
+            _LOG_FILE_PATH = candidate
             break
         except OSError:
             continue
@@ -189,9 +208,6 @@ def _setup_logging_and_streams() -> None:
 
 
 _setup_logging_and_streams()
-
-# Register CUDA/cuDNN DLL paths BEFORE importing transcriber / faster_whisper.
-register_cuda_dlls()
 
 from PyQt6.QtCore import QCoreApplication, QObject, Qt, QThread, QTimer, pyqtSignal  # noqa: E402
 from PyQt6.QtGui import QAction, QActionGroup, QGuiApplication, QIcon  # noqa: E402
@@ -1044,6 +1060,20 @@ class STTTestThread(QThread):
             self.completed.emit(False, safe_msg)
 
 
+class DeviceRefreshThread(QThread):
+    """Background WASAPI loopback enumeration so buggy audio drivers never hang UI startup."""
+
+    devices_loaded = pyqtSignal(list)
+
+    def run(self) -> None:
+        try:
+            devices = list_loopback_devices()
+        except Exception as exc:
+            logger.warning("Async audio device enumeration failed: %s", exc)
+            devices = []
+        self.devices_loaded.emit(devices)
+
+
 class LLMTestThread(QThread):
     """Asynchronous API key & model verification probe for Settings/Home."""
 
@@ -1216,6 +1246,7 @@ class CopilotController(QObject):
         self._models_thread: LLMModelsThread | None = None
         self._web_test_thread: WebSearchTestThread | None = None
         self._stt_test_thread: STTTestThread | None = None
+        self._device_refresh_thread: DeviceRefreshThread | None = None
 
         self._transcriber_thread = self._create_transcriber_thread(self.config)
 
@@ -1250,7 +1281,6 @@ class CopilotController(QObject):
         self.overlay.set_llm_status(self.llm_client.provider_display_name())
         self.dashboard.set_documents([], self.context_manager.summary())
         self.dashboard.set_screens(list_screens())
-        self.refresh_devices()
 
     def _merged_vocabulary(self) -> list[str]:
         doc_terms = self.context_manager.extract_vocabulary_terms()
@@ -1541,12 +1571,27 @@ class CopilotController(QObject):
 
     def start(self) -> None:
         """Start Whisper model worker, global keyboard listener, and restore saved documents."""
+        self.refresh_devices()
         self._transcriber_thread.start()
         self._hotkey_bridge.start()
         self._restore_saved_context_sources()
 
     def refresh_devices(self) -> None:
-        devices = list_loopback_devices()
+        if self._shutting_down or _safe_is_running(self._device_refresh_thread):
+            return
+        worker = DeviceRefreshThread(parent=self)
+        worker.devices_loaded.connect(lambda devs, w=worker: self._on_devices_loaded(devs, w))
+        worker.finished.connect(
+            lambda w=worker: self._cleanup_probe_thread("_device_refresh_thread", w)
+        )
+        worker.finished.connect(worker.deleteLater)
+        self._device_refresh_thread = worker
+        worker.start()
+
+    def _on_devices_loaded(self, devices: list, worker: DeviceRefreshThread) -> None:
+        if self._shutting_down or self._device_refresh_thread is not worker:
+            return
+        self._device_refresh_thread = None
         self.overlay.set_devices(devices)
         self.dashboard.set_devices(devices)
 
@@ -2607,6 +2652,7 @@ class CopilotController(QObject):
             self._models_thread,
             self._web_test_thread,
             self._stt_test_thread,
+            self._device_refresh_thread,
         ):
             if _safe_is_running(probe):
                 assert probe is not None
@@ -2629,7 +2675,7 @@ def _load_app_icon() -> QIcon:
     return QIcon()
 
 
-def _run_smoke_test(out_path: str | None) -> int:
+def _run_smoke_test(out_path: str | None, *, lite: bool = False) -> int:
     """Self-verification mode for both Python and compiled ZoomAICopilot.exe."""
     import io
     import ctranslate2
@@ -2645,6 +2691,7 @@ def _run_smoke_test(out_path: str | None) -> int:
 
     report: dict[str, object] = {
         "frozen": bool(getattr(sys, "frozen", False)),
+        "lite": bool(lite),
         "executable": sys.executable,
     }
 
@@ -2653,10 +2700,14 @@ def _run_smoke_test(out_path: str | None) -> int:
     el_smoke = ElevenLabs(api_key="smoke_test_dummy")
     report["elevenlabs_ok"] = callable(getattr(el_smoke.speech_to_text, "convert", None))
 
-    dll_dirs = register_cuda_dlls()
-    report["dll_dirs"] = dll_dirs
-    cuda_count = ctranslate2.get_cuda_device_count()
-    report["cuda_device_count"] = cuda_count
+    if lite:
+        report["dll_dirs"] = []
+        report["cuda_device_count"] = 0
+    else:
+        dll_dirs = register_cuda_dlls()
+        report["dll_dirs"] = dll_dirs
+        cuda_count = ctranslate2.get_cuda_device_count()
+        report["cuda_device_count"] = cuda_count
 
     silero_path = Path(faster_whisper.__file__).parent / "assets" / "silero_vad_v6.onnx"
     report["silero_vad_exists"] = silero_path.is_file()
@@ -2669,13 +2720,21 @@ def _run_smoke_test(out_path: str | None) -> int:
     d.save(buf)
     report["docx_ok"] = buf.tell() > 0
 
-    # Check WhisperModel CUDA forward pass
-    model = WhisperModel("tiny", device="cuda", compute_type="float16")
-    audio = (0.04 * np.random.default_rng(7).standard_normal(16000)).astype(np.float32)
-    segs, info = model.transcribe(audio, language="uk", vad_filter=True, beam_size=5)
-    _ = list(segs)
-    report["whisper_cuda_ok"] = True
-    report["whisper_lang"] = info.language
+    # Check WhisperModel forward pass (CPU int8 in Lite, CUDA float16 in Full)
+    if lite:
+        model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        audio = (0.04 * np.random.default_rng(7).standard_normal(16000)).astype(np.float32)
+        segs, info = model.transcribe(audio, language="uk", vad_filter=True, beam_size=5)
+        _ = list(segs)
+        report["whisper_cpu_ok"] = True
+        report["whisper_lang"] = info.language
+    else:
+        model = WhisperModel("tiny", device="cuda", compute_type="float16")
+        audio = (0.04 * np.random.default_rng(7).standard_normal(16000)).astype(np.float32)
+        segs, info = model.transcribe(audio, language="uk", vad_filter=True, beam_size=5)
+        _ = list(segs)
+        report["whisper_cuda_ok"] = True
+        report["whisper_lang"] = info.language
 
     devices = list_loopback_devices()
     report["wasapi_devices"] = len(devices)
@@ -2720,13 +2779,17 @@ def _run_smoke_test(out_path: str | None) -> int:
     QTimer.singleShot(350, _inspect_and_exit)
     app.exec()
 
+    whisper_backend_ok = (
+        report.get("whisper_cpu_ok") is True
+        if lite
+        else (report.get("cuda_device_count", 0) >= 1 and report.get("whisper_cuda_ok") is True)
+    )
     passed = (
-        report["cuda_device_count"] >= 1
+        whisper_backend_ok
         and report["silero_vad_exists"] is True
         and report["streaming_vad_ok"] is True
         and report["websockets_ok"] is True
         and report["docx_ok"] is True
-        and report["whisper_cuda_ok"] is True
         and report["wasapi_devices"] >= 1
         and report["stealth_applied"] is True
         and report["compact_manual_input_ok"] is True
@@ -2767,87 +2830,136 @@ def _signal_existing_instance(server_name: str) -> bool:
     return True
 
 
+def _install_crash_hook() -> None:
+    prev_hook = sys.excepthook
+
+    def _on_unhandled_exception(exc_type, exc_value, exc_tb) -> None:
+        logger.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+        log_hint = f"\n\nЛог: {_LOG_FILE_PATH}" if _LOG_FILE_PATH else ""
+        _show_startup_message(
+            "AI Copilot — Помилка",
+            f"Виникла непередбачена помилка:\n{exc_value}{log_hint}",
+            is_error=True,
+        )
+        if prev_hook is not None:
+            prev_hook(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _on_unhandled_exception
+
+
 def main() -> int:
-    """Application entry point with race-safe single-instance IPC."""
+    """Application entry point with race-safe single-instance IPC and crash reporting."""
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--lite", action="store_true")
     parser.add_argument("--smoke-test-out", default="")
     args, qt_args = parser.parse_known_args()
 
     if args.smoke_test:
-        return _run_smoke_test(args.smoke_test_out or None)
+        return _run_smoke_test(args.smoke_test_out or None, lite=args.lite)
+
+    _install_crash_hook()
+    logger.info(
+        "[startup] frozen=%s exe=%s data_dir=%s",
+        bool(getattr(sys, "frozen", False)),
+        sys.executable,
+        _get_runtime_data_dir(),
+    )
 
     instance_guard = WindowsSingleInstanceGuard(SINGLE_INSTANCE_MUTEX_NAME)
     if not instance_guard.acquire():
         app_stub = QCoreApplication([sys.argv[0], *qt_args])
+        signaled = False
         for attempt in range(5):
             if _signal_existing_instance(SINGLE_INSTANCE_SERVER_NAME):
+                signaled = True
                 break
             if attempt < 4:
                 time.sleep(0.20)
         del app_stub
+        if not signaled:
+            logger.warning("Existing instance mutex held, but IPC server did not respond.")
+            _show_startup_message(
+                "AI Copilot вже запущений",
+                "Програма вже працює у фоні (або попередній запуск не відповів).\n"
+                "Перевірте іконку в треї біля годинника або завершіть процес ZoomAICopilot.exe "
+                "в Диспетчері завдань і запустіть знову.",
+                is_error=False,
+            )
         return 0
 
-    app = QApplication([sys.argv[0], *qt_args])
-
-    local_server = QLocalServer(app)
-    QLocalServer.removeServer(SINGLE_INSTANCE_SERVER_NAME)
-    if not local_server.listen(SINGLE_INSTANCE_SERVER_NAME):
-        logger.warning("Single-instance IPC server could not bind (%s)", local_server.errorString())
-
-    app.setQuitOnLastWindowClosed(False)
-    config = load_config()
-    if not config.overlay_stealth or not config.dashboard_stealth:
-        config.overlay_stealth = True
-        config.dashboard_stealth = True
-        save_config_to_env(config)
-
-    app_icon = _load_app_icon()
-    if not app_icon.isNull():
-        app.setWindowIcon(app_icon)
-
-    dashboard = DashboardWindow(config=config, app_icon=app_icon)
-    overlay = CopilotOverlayWindow(
-        hotkey_answer_label=format_hotkey_label(config.hotkey_answer),
-        hotkey_toggle_label=format_hotkey_label(config.hotkey_toggle),
-        hotkey_screen_label=format_hotkey_label(config.hotkey_screen),
-        hotkey_web_label=format_hotkey_label(config.hotkey_web),
-        hotkey_capture_label=format_hotkey_label(config.hotkey_capture),
-        stealth_enabled=config.overlay_stealth,
-        opacity_percent=config.overlay_opacity,
-        font_scale=config.overlay_font_scale,
-        web_search_enabled=config.web_search_enabled,
-        screen_vision_enabled=config.screen_vision_enabled,
-        app_icon=app_icon,
-    )
-
-    controller = CopilotController(
-        config=config,
-        dashboard=dashboard,
-        overlay=overlay,
-        app_icon=app_icon,
-    )
-
-    def _on_second_instance() -> None:
-        while local_server.hasPendingConnections():
-            conn = local_server.nextPendingConnection()
-            if conn is not None:
-                conn.waitForReadyRead(100)
-                conn.close()
-                conn.deleteLater()
-        controller.show_dashboard()
-
-    local_server.newConnection.connect(_on_second_instance)
-    app.aboutToQuit.connect(local_server.close)
-    app.aboutToQuit.connect(controller.shutdown)
-    app.aboutToQuit.connect(instance_guard.release)
-
-    dashboard.show()
-    controller.start()
     try:
-        return app.exec()
-    finally:
+        app = QApplication([sys.argv[0], *qt_args])
+
+        local_server = QLocalServer(app)
+        QLocalServer.removeServer(SINGLE_INSTANCE_SERVER_NAME)
+        if not local_server.listen(SINGLE_INSTANCE_SERVER_NAME):
+            logger.warning("Single-instance IPC server could not bind (%s)", local_server.errorString())
+
+        app.setQuitOnLastWindowClosed(False)
+        config = load_config()
+        if not config.overlay_stealth or not config.dashboard_stealth:
+            config.overlay_stealth = True
+            config.dashboard_stealth = True
+            save_config_to_env(config)
+
+        app_icon = _load_app_icon()
+        if not app_icon.isNull():
+            app.setWindowIcon(app_icon)
+
+        dashboard = DashboardWindow(config=config, app_icon=app_icon)
+        overlay = CopilotOverlayWindow(
+            hotkey_answer_label=format_hotkey_label(config.hotkey_answer),
+            hotkey_toggle_label=format_hotkey_label(config.hotkey_toggle),
+            hotkey_screen_label=format_hotkey_label(config.hotkey_screen),
+            hotkey_web_label=format_hotkey_label(config.hotkey_web),
+            hotkey_capture_label=format_hotkey_label(config.hotkey_capture),
+            stealth_enabled=config.overlay_stealth,
+            opacity_percent=config.overlay_opacity,
+            font_scale=config.overlay_font_scale,
+            web_search_enabled=config.web_search_enabled,
+            screen_vision_enabled=config.screen_vision_enabled,
+            app_icon=app_icon,
+        )
+
+        controller = CopilotController(
+            config=config,
+            dashboard=dashboard,
+            overlay=overlay,
+            app_icon=app_icon,
+        )
+
+        def _on_second_instance() -> None:
+            while local_server.hasPendingConnections():
+                conn = local_server.nextPendingConnection()
+                if conn is not None:
+                    conn.waitForReadyRead(100)
+                    conn.close()
+                    conn.deleteLater()
+            controller.show_dashboard()
+
+        local_server.newConnection.connect(_on_second_instance)
+        app.aboutToQuit.connect(local_server.close)
+        app.aboutToQuit.connect(controller.shutdown)
+        app.aboutToQuit.connect(instance_guard.release)
+
+        dashboard.show()
+        controller.start()
+        logger.info("[startup] Dashboard shown and background workers started")
+        try:
+            return app.exec()
+        finally:
+            instance_guard.release()
+    except Exception as exc:
+        logger.exception("Fatal startup error")
         instance_guard.release()
+        log_hint = f"\n\nДеталі у файлі:\n{_LOG_FILE_PATH}" if _LOG_FILE_PATH else ""
+        _show_startup_message(
+            "AI Copilot — Помилка запуску",
+            f"Не вдалося запустити програму:\n{exc}{log_hint}",
+            is_error=True,
+        )
+        return 1
 
 
 if __name__ == "__main__":

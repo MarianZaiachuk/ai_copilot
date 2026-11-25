@@ -301,3 +301,8 @@ def test_profile_store_migration_crud_and_persistence(tmp_path: Path) -> None:
     reloaded.delete_profile("english-speaking")
     assert len(reloaded.profiles) == 1
     assert reloaded.delete_profile(reloaded.active_profile().id) is None
+
+
+def test_is_dir_writable_probe(tmp_path: Path) -> None:
+    assert config.is_dir_writable(tmp_path) is True
+    assert config.is_dir_writable(tmp_path / "missing") is False

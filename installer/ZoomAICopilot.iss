@@ -1,8 +1,14 @@
 #define MyAppName "AI Copilot"
-#define MyAppVersion "1.1"
+#define MyAppVersion "1.2"
 #define MyAppPublisher "MarianZaiachuk"
 #define MyAppURL "https://github.com/MarianZaiachuk/ai_copilot"
 #define MyAppExeName "ZoomAICopilot.exe"
+#ifndef BuildVariant
+  #define BuildVariant ""
+#endif
+#ifndef SourceDir
+  #define SourceDir "..\dist\ZoomAICopilot"
+#endif
 
 [Setup]
 AppId={{D9A2F8B4-71E3-4E2A-B8C5-6E4F3D2A1091}
@@ -22,7 +28,11 @@ ArchitecturesInstallIn64BitMode=x64compatible
 SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 OutputDir=..\release
+#if BuildVariant == "Lite"
+OutputBaseFilename=ZoomAICopilot-Lite-Setup-v{#MyAppVersion}
+#else
 OutputBaseFilename=ZoomAICopilot-Setup-v{#MyAppVersion}
+#endif
 Compression=lzma2/fast
 LZMAUseSeparateProcess=yes
 LZMANumBlockThreads=4
@@ -39,8 +49,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; Explicit clean allowlist: never include local .env, logs, context_sources.json, or prompt_profiles.json
-Source: "..\dist\ZoomAICopilot\ZoomAICopilot.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\dist\ZoomAICopilot\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\ZoomAICopilot.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\.env.example"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]

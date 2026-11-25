@@ -18,7 +18,6 @@ from urllib.parse import urlencode
 import wave
 
 from dotenv import load_dotenv
-from elevenlabs import ElevenLabs
 import numpy as np
 import requests
 from websockets.sync.client import connect as _ws_connect
@@ -28,10 +27,28 @@ from security import redact_secrets
 
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
-# Register pip-installed or bundled NVIDIA cuBLAS / cuDNN DLLs BEFORE importing faster_whisper.
-register_cuda_dlls()
+# Lazily loaded on first use so GUI startup stays instant; placeholders keep test patches working.
+WhisperModel: Any = None
+ElevenLabs: Any = None
 
-from faster_whisper import WhisperModel  # noqa: E402
+
+def _get_whisper_model_cls() -> Any:
+    global WhisperModel
+    if WhisperModel is None:
+        register_cuda_dlls()
+        from faster_whisper import WhisperModel as _WhisperModel
+
+        WhisperModel = _WhisperModel
+    return WhisperModel
+
+
+def _get_elevenlabs_cls() -> Any:
+    global ElevenLabs
+    if ElevenLabs is None:
+        from elevenlabs import ElevenLabs as _ElevenLabs
+
+        ElevenLabs = _ElevenLabs
+    return ElevenLabs
 
 UK_FINE_TUNED_WHISPER_REPO = (
     "skypro1111/whisper-large-v3-turbo-ukrainian-ukraine-3percent-ct2"
@@ -553,7 +570,7 @@ class WhisperTranscriber:
 
     def load_model(self) -> tuple[str, str]:
         """Load Whisper model on configured device with CUDA int8 / CPU int8 fallbacks."""
-        register_cuda_dlls()
+        whisper_cls = _get_whisper_model_cls()
         with self._state_lock:
             cfg = self.config
         requested_device = cfg.whisper_device.lower()
@@ -563,7 +580,7 @@ class WhisperTranscriber:
         if requested_device == "cpu":
             compute = "int8" if requested_compute in _CPU_UNSUPPORTED_COMPUTE_TYPES else requested_compute
             self._emit_status(f"Завантаження {cfg.whisper_model} (CPU)...")
-            model = WhisperModel(
+            model = whisper_cls(
                 resolved_model,
                 device="cpu",
                 compute_type=compute,
@@ -577,7 +594,7 @@ class WhisperTranscriber:
             self._emit_status(
                 f"Завантаження {cfg.whisper_model} ({requested_device.upper()})..."
             )
-            model = WhisperModel(
+            model = whisper_cls(
                 resolved_model,
                 device=requested_device,
                 compute_type=requested_compute,
@@ -601,7 +618,7 @@ class WhisperTranscriber:
             ):
                 try:
                     self._emit_status(f"Завантаження {cfg.whisper_model} (CUDA int8)...")
-                    model = WhisperModel(
+                    model = whisper_cls(
                         resolved_model,
                         device="cuda",
                         compute_type="int8",
@@ -622,7 +639,7 @@ class WhisperTranscriber:
                 exc,
             )
             self._emit_status("CUDA недоступна — перехід на CPU (int8)...")
-            model = WhisperModel(
+            model = whisper_cls(
                 resolved_model,
                 device="cpu",
                 compute_type="int8",
@@ -639,7 +656,8 @@ class WhisperTranscriber:
         with self._state_lock:
             model_name = self.config.whisper_model
         resolved_model = _resolve_cached_whisper_model(model_name)
-        model = WhisperModel(
+        whisper_cls = _get_whisper_model_cls()
+        model = whisper_cls(
             resolved_model,
             device="cpu",
             compute_type="int8",
@@ -947,7 +965,7 @@ class CloudSTTTranscriber:
             self._groq_key = api_key
             return client
 
-    def _get_elevenlabs_client(self, api_key: str) -> ElevenLabs:
+    def _get_elevenlabs_client(self, api_key: str) -> Any:
         with self._state_lock:
             _load_elevenlabs_env()
             effective_key = (api_key or os.getenv("ELEVENLABS_API_KEY", "")).strip()
@@ -955,7 +973,7 @@ class CloudSTTTranscriber:
                 os.environ["ELEVENLABS_API_KEY"] = effective_key
             if self._elevenlabs_client is not None and self._elevenlabs_key == effective_key:
                 return self._elevenlabs_client
-            client = ElevenLabs(api_key=effective_key, timeout=25.0)
+            client = _get_elevenlabs_cls()(api_key=effective_key, timeout=25.0)
             self._elevenlabs_client = client
             self._elevenlabs_key = effective_key
             return client
@@ -1311,7 +1329,7 @@ def verify_stt_provider(config: AppConfig) -> tuple[bool, str]:
             _load_elevenlabs_env()
             if api_key and os.getenv("ELEVENLABS_API_KEY", "").strip() != api_key:
                 os.environ["ELEVENLABS_API_KEY"] = api_key
-            _ = ElevenLabs(api_key=api_key, timeout=8.0)
+            _ = _get_elevenlabs_cls()(api_key=api_key, timeout=8.0)
             resp = requests.get(
                 "https://api.elevenlabs.io/v1/user",
                 headers={"xi-api-key": api_key},
