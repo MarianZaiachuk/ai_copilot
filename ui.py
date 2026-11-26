@@ -10,12 +10,16 @@ from typing import Iterable
 
 from PyQt6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import (
+    QColor,
     QDesktopServices,
+    QFont,
+    QFontDatabase,
     QGuiApplication,
     QIcon,
     QKeySequence,
     QMouseEvent,
     QPainter,
+    QPalette,
     QShortcut,
 )
 from PyQt6.QtWidgets import (
@@ -40,8 +44,133 @@ from PyQt6.QtWidgets import (
 )
 
 from audio_capture import AudioDeviceInfo
+from config import get_resource_path
 from context_loader import build_file_dialog_filter
 from latex_renderer import extract_latex_placeholders, has_latex_math, inject_latex_html
+
+_LOADED_UI_FONT_FAMILY: str | None = None
+
+
+def get_ui_font_stack(primary_family: str | None = None) -> str:
+    """Return CSS/QSS font-family stack prioritizing bundled Inter and Windows fallbacks."""
+    family = (primary_family or _LOADED_UI_FONT_FAMILY or "Inter").strip() or "Inter"
+    if family.lower() in {"segoe ui", "segoe ui emoji", "sans-serif"}:
+        return '"Segoe UI", "Segoe UI Emoji", sans-serif'
+    return f'"{family}", "Inter", "Segoe UI", "Segoe UI Emoji", sans-serif'
+
+
+def _build_dark_palette() -> QPalette:
+    """Build an OS-independent dark Fusion palette so Light Mode hosts never leak black text."""
+    palette = QPalette()
+    roles: dict[QPalette.ColorRole, QColor] = {
+        QPalette.ColorRole.Window: QColor("#0E1117"),
+        QPalette.ColorRole.WindowText: QColor("#E6EDF6"),
+        QPalette.ColorRole.Base: QColor("#10141D"),
+        QPalette.ColorRole.AlternateBase: QColor("#141923"),
+        QPalette.ColorRole.ToolTipBase: QColor("#141923"),
+        QPalette.ColorRole.ToolTipText: QColor("#F1F5F9"),
+        QPalette.ColorRole.Text: QColor("#F1F5F9"),
+        QPalette.ColorRole.PlaceholderText: QColor("#64748B"),
+        QPalette.ColorRole.Button: QColor("#1E2534"),
+        QPalette.ColorRole.ButtonText: QColor("#E3EAF5"),
+        QPalette.ColorRole.BrightText: QColor("#FFFFFF"),
+        QPalette.ColorRole.Link: QColor("#60A5FA"),
+        QPalette.ColorRole.Highlight: QColor("#F59E0B"),
+        QPalette.ColorRole.HighlightedText: QColor("#0E1117"),
+        QPalette.ColorRole.Dark: QColor("#0A0D12"),
+        QPalette.ColorRole.Mid: QColor("#1F2937"),
+        QPalette.ColorRole.Light: QColor("#2D3748"),
+    }
+    for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+        for role, color in roles.items():
+            palette.setColor(group, role, color)
+    disabled_roles = {
+        QPalette.ColorRole.WindowText: QColor("#64748B"),
+        QPalette.ColorRole.Text: QColor("#64748B"),
+        QPalette.ColorRole.ButtonText: QColor("#64748B"),
+        QPalette.ColorRole.Highlight: QColor("#253047"),
+        QPalette.ColorRole.HighlightedText: QColor("#94A3B8"),
+    }
+    for role, color in roles.items():
+        palette.setColor(QPalette.ColorGroup.Disabled, role, disabled_roles.get(role, color))
+    return palette
+
+
+def apply_dark_theme_and_fonts(app: QApplication) -> str:
+    """Force Qt Fusion dark palette, load bundled Inter TTFs, and style global popups."""
+    global _LOADED_UI_FONT_FAMILY
+    try:
+        app.setStyle("Fusion")
+        app.setProperty("copilot_theme_style", "Fusion")
+    except Exception:
+        pass
+
+    primary_family = ""
+    fonts_dir = get_resource_path("assets/fonts")
+    if fonts_dir.is_dir():
+        for font_file in sorted(fonts_dir.iterdir()):
+            if not font_file.is_file() or font_file.suffix.lower() not in {".ttf", ".otf"}:
+                continue
+            try:
+                font_id = QFontDatabase.addApplicationFont(str(font_file))
+                if font_id >= 0:
+                    families = QFontDatabase.applicationFontFamilies(font_id)
+                    if families and not primary_family:
+                        primary_family = families[0]
+            except Exception:
+                continue
+
+    if not primary_family:
+        primary_family = "Segoe UI"
+    _LOADED_UI_FONT_FAMILY = primary_family
+
+    app.setFont(QFont(primary_family, 9))
+    app.setPalette(_build_dark_palette())
+
+    font_stack = get_ui_font_stack(primary_family)
+    app.setStyleSheet(
+        f"""
+        QWidget {{
+            font-family: {font_stack};
+        }}
+        QToolTip {{
+            background-color: #141923;
+            color: #F1F5F9;
+            border: 1px solid #323F5B;
+            border-radius: 6px;
+            padding: 5px 8px;
+        }}
+        QMenu {{
+            background-color: #141923;
+            color: #E6EDF6;
+            border: 1px solid #2D3648;
+            border-radius: 6px;
+            padding: 4px;
+        }}
+        QMenu::item {{
+            padding: 5px 14px;
+            border-radius: 4px;
+            color: #E6EDF6;
+        }}
+        QMenu::item:selected {{
+            background-color: #20283B;
+            color: #FFFFFF;
+        }}
+        QMenu::separator {{
+            height: 1px;
+            background: #232B3B;
+            margin: 4px 6px;
+        }}
+        QDialog, QMessageBox {{
+            background-color: #141923;
+            color: #E6EDF6;
+        }}
+        QMessageBox QLabel {{
+            color: #E6EDF6;
+        }}
+        """
+    )
+    return primary_family
 
 WDA_NONE = 0x00000000
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
@@ -52,6 +181,7 @@ _FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
 DARK_MARKDOWN_CSS = """
 body {
     color: #F1F5F9;
+    font-family: "Inter", "Segoe UI", "Segoe UI Emoji", sans-serif;
     line-height: 1.45;
 }
 code {
@@ -59,7 +189,7 @@ code {
     color: #FDE68A;
     padding: 1px 4px;
     border-radius: 4px;
-    font-family: "Consolas", "Cascadia Code", monospace;
+    font-family: "Consolas", "Cascadia Code", "Segoe UI Emoji", monospace;
 }
 pre {
     background-color: #0D1119;
@@ -67,7 +197,7 @@ pre {
     border: 1px solid #263145;
     border-radius: 6px;
     padding: 8px 10px;
-    font-family: "Consolas", "Cascadia Code", monospace;
+    font-family: "Consolas", "Cascadia Code", "Segoe UI Emoji", monospace;
     white-space: pre-wrap;
 }
 a {
@@ -237,14 +367,24 @@ class ElidedLabel(QLabel):
         flags = int(self.alignment().value) | int(Qt.TextFlag.TextSingleLine.value)
         painter.drawText(rect, flags, elided)
 
-DARK_OVERLAY_QSS = """
+def build_overlay_qss(primary_family: str | None = None) -> str:
+    """Return overlay QSS with bundled Inter font stack and explicit dark QLabel color."""
+    font_stack = get_ui_font_stack(primary_family)
+    return _DARK_OVERLAY_QSS_TEMPLATE.replace("__UI_FONT_STACK__", font_stack)
+
+
+_DARK_OVERLAY_QSS_TEMPLATE = """
 QWidget#RootContainer {
     background-color: #11151E;
     border: 1px solid #2C3548;
     border-radius: 10px;
     color: #E8EEF7;
-    font-family: "Segoe UI", "Inter", sans-serif;
+    font-family: __UI_FONT_STACK__;
     font-size: 13px;
+}
+QLabel {
+    color: #E2E8F0;
+    background-color: transparent;
 }
 QWidget#TitleBar {
     background-color: #171D28;
@@ -544,6 +684,9 @@ QSlider::handle:horizontal {
 """ + DARK_SCROLLBAR_QSS
 
 
+DARK_OVERLAY_QSS = build_overlay_qss("Inter")
+
+
 def get_window_display_affinity(hwnd: int) -> int | None:
     """Query current Windows DWM display affinity for a top-level HWND."""
     if sys.platform != "win32" or hwnd <= 0:
@@ -697,7 +840,7 @@ class CopilotOverlayWindow(QWidget):
 
         self._build_ui()
         self._setup_shortcuts()
-        self.setStyleSheet(DARK_OVERLAY_QSS)
+        self.setStyleSheet(build_overlay_qss())
         self.set_font_scale(self._font_scale)
         self.set_opacity_percent(opacity_percent)
         self.set_stealth_mode(self._stealth_enabled)

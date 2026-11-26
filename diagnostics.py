@@ -12,7 +12,7 @@ import platform
 import sys
 from typing import Any
 
-from config import get_app_dir, get_env_file_path, is_dir_writable
+from config import get_env_file_path, get_runtime_data_dir, is_dir_writable
 from security import redact_secrets
 
 _PF_AVX2_INSTRUCTIONS_AVAILABLE = 40
@@ -53,12 +53,7 @@ def check_vcredist_x64() -> dict[str, Any]:
 
 
 def _diagnostics_data_dir() -> Path:
-    app_dir = get_app_dir()
-    if is_dir_writable(app_dir):
-        return app_dir
-    target = Path(os.getenv("APPDATA", str(Path.home()))) / "ZoomAICopilot"
-    target.mkdir(parents=True, exist_ok=True)
-    return target
+    return get_runtime_data_dir()
 
 
 def _probe_module(mod_name: str, *, import_check: bool = True) -> dict[str, Any]:

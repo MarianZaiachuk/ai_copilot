@@ -114,8 +114,34 @@ def build_ico_bytes(png_frames: list[tuple[int, bytes]]) -> bytes:
     return header + b"".join(entries) + b"".join(payloads)
 
 
+def render_checkmark_image(size: int = 16) -> QImage:
+    """Render a crisp transparent dark-ink checkmark PNG for styled dark checkboxes."""
+    img = QImage(size, size, QImage.Format.Format_ARGB32)
+    img.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(img)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+    s = float(size)
+    pen = QPen(
+        QColor("#0E1117"),
+        max(2.0, s * 0.16),
+        Qt.PenStyle.SolidLine,
+        Qt.PenCapStyle.RoundCap,
+        Qt.PenJoinStyle.RoundJoin,
+    )
+    painter.setPen(pen)
+    path = QPainterPath()
+    path.moveTo(s * 0.22, s * 0.52)
+    path.lineTo(s * 0.43, s * 0.73)
+    path.lineTo(s * 0.80, s * 0.28)
+    painter.drawPath(path)
+    painter.end()
+    return img
+
+
 def generate_icons(assets_dir: Path | None = None) -> tuple[Path, Path]:
-    """Generate assets/icon.png (256px) and multi-size assets/icon.ico."""
+    """Generate assets/icon.png (256px), multi-size assets/icon.ico, and assets/check.png."""
     app = QGuiApplication.instance()
     owns_app = False
     if app is None:
@@ -136,8 +162,10 @@ def generate_icons(assets_dir: Path | None = None) -> tuple[Path, Path]:
 
     png_path = target_dir / "icon.png"
     ico_path = target_dir / "icon.ico"
+    check_path = target_dir / "check.png"
     png_path.write_bytes(png_256)
     ico_path.write_bytes(build_ico_bytes(frames))
+    check_path.write_bytes(_image_to_png_bytes(render_checkmark_image(16)))
 
     if owns_app:
         app.quit()

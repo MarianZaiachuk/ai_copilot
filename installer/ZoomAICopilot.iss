@@ -1,5 +1,5 @@
 #define MyAppName "AI Copilot"
-#define MyAppVersion "1.3"
+#define MyAppVersion "1.3.1"
 #define MyAppPublisher "MarianZaiachuk"
 #define MyAppURL "https://github.com/MarianZaiachuk/ai_copilot"
 #define MyAppExeName "ZoomAICopilot.exe"
@@ -21,8 +21,7 @@ AppUpdatesURL={#MyAppURL}/releases
 DefaultDirName={autopf}\ZoomAICopilot
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 SetupIconFile=..\assets\icon.ico

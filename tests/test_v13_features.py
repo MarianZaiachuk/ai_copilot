@@ -39,6 +39,7 @@ def test_latex_renderer_and_qtextbrowser_integration() -> None:
 
     app = QApplication.instance() or QApplication([])
     assert app is not None
+    ui.apply_dark_theme_and_fonts(app)
     browser = QTextBrowser()
     ui.configure_markdown_browser(browser)
     ui.set_browser_markdown_sticky(browser, src)
@@ -158,21 +159,73 @@ def test_diagnostics_report_and_software_fallback(tmp_path: Path, monkeypatch: p
     assert "modules" in report
     assert "summary" in report
 
-    # Software rendering helper activates QT_OPENGL=software on sentinel or --software
+    # Software rendering helper defaults to True, supports --hardware opt-out,
+    # and forces software mode back on when --software or crash sentinel is present.
     sentinel = tmp_path / ".startup_in_progress"
-    sentinel.write_text("1234", encoding="utf-8")
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
-    monkeypatch.delenv("QT_OPENGL", raising=False)
-    monkeypatch.delenv("QSG_RHI_BACKEND", raising=False)
-    monkeypatch.delenv("QT_QUICK_BACKEND", raising=False)
+    monkeypatch.delenv("ZOOM_COPILOT_SOFTWARE_GL", raising=False)
+    monkeypatch.delenv("ZOOM_COPILOT_HARDWARE_GL", raising=False)
+    for var in ("QT_OPENGL", "QSG_RHI_BACKEND", "QT_QUICK_BACKEND"):
+        monkeypatch.delenv(var, raising=False)
 
     assert app_main._apply_software_rendering_env_if_needed(argv=[], sentinel_path=sentinel) is True
     assert os.environ.get("QT_OPENGL") == "software"
+    for var in ("QT_OPENGL", "QSG_RHI_BACKEND", "QT_QUICK_BACKEND"):
+        monkeypatch.delenv(var, raising=False)
+
+    assert app_main._apply_software_rendering_env_if_needed(argv=["--hardware"], sentinel_path=sentinel) is False
+    assert os.environ.get("QT_OPENGL") is None
+
+    monkeypatch.setenv("ZOOM_COPILOT_HARDWARE_GL", "1")
+    assert app_main._apply_software_rendering_env_if_needed(argv=[], sentinel_path=sentinel) is False
+    monkeypatch.delenv("ZOOM_COPILOT_HARDWARE_GL", raising=False)
+
+    sentinel.write_text("1234", encoding="utf-8")
+    assert app_main._apply_software_rendering_env_if_needed(argv=["--hardware"], sentinel_path=sentinel) is True
+    assert os.environ.get("QT_OPENGL") == "software"
+
+
+def test_program_files_routes_data_to_appdata_and_dark_theme_fonts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Forced Fusion dark theme + bundled Inter fonts (real assets/fonts before mocking get_app_dir)
+    app = QApplication.instance() or QApplication([])
+    loaded_family = ui.apply_dark_theme_and_fonts(app)
+    assert "inter" in loaded_family.lower()
+    assert app.property("copilot_theme_style") == "Fusion"
+    pal = app.palette()
+    assert pal.color(pal.ColorRole.Window).name().lower() == "#0e1117"
+    assert pal.color(pal.ColorRole.WindowText).lightness() > pal.color(pal.ColorRole.Window).lightness()
+    dash_qss = dashboard._build_dashboard_qss(loaded_family)
+    assert "QCheckBox::indicator" in dash_qss
+    assert "QLabel {" in dash_qss
+
+    fake_pf = tmp_path / "Program Files"
+    fake_app_dir = fake_pf / "ZoomAICopilot"
+    fake_app_dir.mkdir(parents=True, exist_ok=True)
+    fake_appdata = tmp_path / "AppDataRoaming"
+
+    monkeypatch.setenv("ProgramFiles", str(fake_pf))
+    monkeypatch.setenv("ProgramW6432", str(fake_pf))
+    monkeypatch.setenv("APPDATA", str(fake_appdata))
+    monkeypatch.setattr(config, "get_app_dir", lambda: fake_app_dir)
+
+    assert config.is_under_program_files(fake_app_dir) is True
+    assert config.is_under_program_files(tmp_path / "Portable") is False
+
+    # Seed legacy runtime file inside Program Files and verify one-time copy into %APPDATA%
+    (fake_app_dir / "prompt_profiles.json").write_text('{"profiles":[]}', encoding="utf-8")
+    env_path = config.get_env_file_path()
+    data_dir = config.get_runtime_data_dir()
+    assert env_path == fake_appdata / "ZoomAICopilot" / ".env"
+    assert data_dir == fake_appdata / "ZoomAICopilot"
+    assert (data_dir / "prompt_profiles.json").is_file()
 
 
 def test_snip_hotkey_card_history_and_ui_fit() -> None:
     app = QApplication.instance() or QApplication([])
     assert app is not None
+    ui.apply_dark_theme_and_fonts(app)
 
     assert app_main.parse_hotkey_spec("ctrl+alt+a") == (frozenset({"ctrl", "alt"}), 0x41)
     bridge = app_main.GlobalHotkeyBridge(
@@ -199,8 +252,12 @@ def test_snip_hotkey_card_history_and_ui_fit() -> None:
     assert screen_capture.capture_screen_region(QRect(0, 0, 4, 4)) is None
 
     ov = ui.CopilotOverlayWindow()
-    dash = dashboard.DashboardWindow(config=config.AppConfig())
+    dash = dashboard.DashboardWindow(
+        config=config.AppConfig(web_search_enabled=True, screen_vision_enabled=True)
+    )
     try:
+        dash.show()
+        app.processEvents()
         assert ov._title_bar.minimumSizeHint().width() <= 430
         dash_min = dash.minimumSizeHint()
         assert dash_min.width() <= 840 and dash_min.height() <= 560

@@ -22,9 +22,8 @@ from config import (
     DEFAULT_SYSTEM_PROMPT,
     ProfileStore,
     PromptProfile,
-    get_app_dir,
     get_resource_path,
-    is_dir_writable,
+    get_runtime_data_dir,
     load_config,
     parse_custom_vocabulary,
     register_cuda_dlls,
@@ -87,13 +86,8 @@ class WindowsSingleInstanceGuard:
 
 
 def _get_runtime_data_dir() -> Path:
-    """Return writable directory for logs and runtime state (AppDir or %APPDATA%)."""
-    app_dir = get_app_dir()
-    if is_dir_writable(app_dir):
-        return app_dir
-    appdata_dir = Path(os.getenv("APPDATA", str(Path.home()))) / "ZoomAICopilot"
-    appdata_dir.mkdir(parents=True, exist_ok=True)
-    return appdata_dir
+    """Return consistent writable directory for logs and runtime state (AppDir or %APPDATA%)."""
+    return get_runtime_data_dir()
 
 
 class _LoggingStdStream(io.TextIOBase):
@@ -220,10 +214,10 @@ def _apply_software_rendering_env_if_needed(
     argv: list[str] | None = None,
     sentinel_path: Path | None = None,
 ) -> bool:
-    """Enable Qt software rendering on --software, env override, or prior startup crash."""
+    """Enable Qt software rendering by default on Windows unless --hardware / env opt-out."""
     args_list = list(sys.argv[1:] if argv is None else argv)
     sentinel = sentinel_path or _startup_sentinel_path()
-    forced = (
+    forced_software = (
         "--software" in args_list
         or os.getenv("ZOOM_COPILOT_SOFTWARE_GL", "").strip().lower() in {"1", "true", "yes"}
     )
@@ -232,13 +226,22 @@ def _apply_software_rendering_env_if_needed(
         and "--smoke-test" not in args_list
         and not os.getenv("PYTEST_CURRENT_TEST")
     )
-    if not forced and not recovered:
+    hardware_opt_out = (
+        "--hardware" in args_list
+        or os.getenv("ZOOM_COPILOT_HARDWARE_GL", "").strip().lower() in {"1", "true", "yes"}
+    )
+    if hardware_opt_out and not forced_software and not recovered:
         return False
 
     os.environ.setdefault("QT_OPENGL", "software")
     os.environ.setdefault("QSG_RHI_BACKEND", "software")
     os.environ.setdefault("QT_QUICK_BACKEND", "software")
-    reason = "--software / env" if forced else "previous incomplete startup"
+    if forced_software:
+        reason = "--software / env"
+    elif recovered:
+        reason = "previous incomplete startup"
+    else:
+        reason = "default compatibility mode"
     logging.getLogger(__name__).warning("[startup] Qt software rendering enabled (%s)", reason)
     return True
 
@@ -304,7 +307,12 @@ try:
         WhisperTranscriber,
         verify_stt_provider,
     )
-    from ui import CopilotOverlayWindow, apply_window_display_affinity  # noqa: E402
+    from ui import (  # noqa: E402
+        CopilotOverlayWindow,
+        apply_dark_theme_and_fonts,
+        apply_window_display_affinity,
+        get_ui_font_stack,
+    )
     from web_search import search_web  # noqa: E402
 except Exception as _import_exc:
     logging.getLogger(__name__).critical(
@@ -3007,6 +3015,7 @@ def _run_smoke_test(out_path: str | None, *, lite: bool = False) -> int:
 
     cfg = load_config()
     app = QApplication.instance() or QApplication(sys.argv)
+    apply_dark_theme_and_fonts(app)
     app_icon = _load_app_icon()
 
     dash = DashboardWindow(config=cfg, app_icon=app_icon)
@@ -3096,6 +3105,40 @@ def _signal_existing_instance(server_name: str) -> bool:
     return True
 
 
+def _terminate_stale_copilot_pid(pid: int) -> bool:
+    """Verify `pid` is a ZoomAICopilot.exe process and terminate it safely after startup hang."""
+    if sys.platform != "win32" or pid <= 0 or pid == os.getpid():
+        return False
+    process_query_limited = 0x1000
+    process_terminate = 0x0001
+    synchronize = 0x00100000
+    handle = None
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = k32.OpenProcess(process_query_limited | process_terminate | synchronize, False, int(pid))
+        if not handle:
+            return False
+        buf = ctypes.create_unicode_buffer(1024)
+        size = ctypes.c_uint32(len(buf))
+        if not k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return False
+        image_path = buf.value.strip().lower()
+        if not image_path.endswith("zoomaicopilot.exe"):
+            return False
+        if not k32.TerminateProcess(handle, 1):
+            return False
+        k32.WaitForSingleObject(handle, 2000)
+        return True
+    except Exception:
+        return False
+    finally:
+        if handle:
+            try:
+                ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+            except Exception:
+                pass
+
+
 def _install_crash_hook() -> None:
     _early_install_crash_hook()
 
@@ -3113,7 +3156,7 @@ class _StartupSplash(QWidget):
         self.setFixedSize(300, 108)
         self.setStyleSheet(
             "background-color:#11151E; border:1px solid #2C3548; border-radius:10px; "
-            "color:#F8FAFC; font-family:'Segoe UI', sans-serif;"
+            f"color:#F8FAFC; font-family:{get_ui_font_stack()};"
         )
         if app_icon is not None and not app_icon.isNull():
             self.setWindowIcon(app_icon)
@@ -3158,6 +3201,7 @@ def main() -> int:
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--lite", action="store_true")
     parser.add_argument("--software", action="store_true")
+    parser.add_argument("--hardware", action="store_true")
     parser.add_argument("--diagnose", action="store_true")
     parser.add_argument("--diagnose-out", default="")
     parser.add_argument("--smoke-test-out", default="")
@@ -3183,6 +3227,7 @@ def main() -> int:
         _get_runtime_data_dir(),
     )
 
+    sentinel = _startup_sentinel_path()
     instance_guard = WindowsSingleInstanceGuard(SINGLE_INSTANCE_MUTEX_NAME)
     if not instance_guard.acquire():
         app_stub = QCoreApplication([sys.argv[0], *qt_args])
@@ -3194,7 +3239,25 @@ def main() -> int:
             if attempt < 4:
                 time.sleep(0.20)
         del app_stub
-        if not signaled:
+        if signaled:
+            return 0
+
+        recovered_hung = False
+        if sentinel.is_file():
+            try:
+                stale_pid = int(sentinel.read_text(encoding="utf-8").strip())
+            except (OSError, ValueError):
+                stale_pid = 0
+            if stale_pid > 0 and _terminate_stale_copilot_pid(stale_pid):
+                logger.warning(
+                    "[startup] Terminated hung previous ZoomAICopilot.exe (pid=%d); retrying lock.",
+                    stale_pid,
+                )
+                time.sleep(0.30)
+                if instance_guard.acquire():
+                    recovered_hung = True
+
+        if not recovered_hung:
             logger.warning("Existing instance mutex held, but IPC server did not respond.")
             _show_startup_message(
                 "AI Copilot вже запущений",
@@ -3203,9 +3266,8 @@ def main() -> int:
                 "в Диспетчері завдань і запустіть знову.",
                 is_error=False,
             )
-        return 0
+            return 0
 
-    sentinel = _startup_sentinel_path()
     try:
         sentinel.parent.mkdir(parents=True, exist_ok=True)
         sentinel.write_text(str(os.getpid()), encoding="utf-8")
@@ -3215,6 +3277,7 @@ def main() -> int:
     splash: _StartupSplash | None = None
     try:
         app = QApplication([sys.argv[0], *qt_args])
+        apply_dark_theme_and_fonts(app)
         app_icon = _load_app_icon()
         if not app_icon.isNull():
             app.setWindowIcon(app_icon)

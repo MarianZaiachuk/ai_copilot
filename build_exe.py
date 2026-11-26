@@ -48,12 +48,17 @@ def _create_windows_shortcut(exe_path: Path, link_path: Path) -> None:
 
 
 def _needs_icon_rebuild(root: Path, icon_png: Path, icon_ico: Path) -> bool:
-    if not icon_png.is_file() or not icon_ico.is_file():
+    check_png = root / "assets" / "check.png"
+    if not icon_png.is_file() or not icon_ico.is_file() or not check_png.is_file():
         return True
     gen_py = root / "icon_gen.py"
     if gen_py.is_file():
         gen_mtime = gen_py.stat().st_mtime
-        if icon_png.stat().st_mtime < gen_mtime or icon_ico.stat().st_mtime < gen_mtime:
+        if (
+            icon_png.stat().st_mtime < gen_mtime
+            or icon_ico.stat().st_mtime < gen_mtime
+            or check_png.stat().st_mtime < gen_mtime
+        ):
             return True
     return False
 

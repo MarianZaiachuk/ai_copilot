@@ -47,6 +47,7 @@ from config import (
     PromptProfile,
     get_provider_api_key,
     get_provider_model,
+    get_resource_path,
     has_valid_llm_credentials,
 )
 from context_loader import LoadedDocument, build_file_dialog_filter
@@ -57,6 +58,7 @@ from ui import (
     ElidedLabel,
     apply_window_display_affinity,
     configure_markdown_browser,
+    get_ui_font_stack,
     get_window_display_affinity,
     set_browser_markdown_sticky,
 )
@@ -170,12 +172,55 @@ PROFILE_LANG_CHOICES: list[tuple[str, str]] = [
     ("", "Не змінювати мову STT"),
 ]
 
-DASHBOARD_QSS = """
+def _build_dashboard_qss(primary_family: str | None = None) -> str:
+    """Build dark Dashboard stylesheet with bundled Inter font stack and dark-safe controls."""
+    font_stack = get_ui_font_stack(primary_family)
+    check_path = get_resource_path("assets/check.png")
+    check_rule = (
+        f'\n    image: url("{check_path.as_posix()}");'
+        if check_path.is_file()
+        else ""
+    )
+    qss = _DASHBOARD_QSS_TEMPLATE.replace("__UI_FONT_STACK__", font_stack)
+    return qss.replace("__CHECK_IMAGE_RULE__", check_rule)
+
+
+_DASHBOARD_QSS_TEMPLATE = """
 QWidget#DashboardRoot {
     background-color: #0E1117;
     color: #E6EDF6;
-    font-family: "Segoe UI", "Inter", sans-serif;
+    font-family: __UI_FONT_STACK__;
     font-size: 13px;
+}
+QLabel {
+    color: #E2E8F0;
+    background-color: transparent;
+}
+QCheckBox {
+    color: #E2E8F0;
+    spacing: 8px;
+    background-color: transparent;
+}
+QCheckBox:disabled {
+    color: #64748B;
+}
+QCheckBox::indicator {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border: 1px solid #3B4963;
+    background-color: #10141D;
+}
+QCheckBox::indicator:hover {
+    border-color: #F59E0B;
+}
+QCheckBox::indicator:checked {
+    background-color: #F59E0B;
+    border-color: #FBBF24;__CHECK_IMAGE_RULE__
+}
+QCheckBox::indicator:disabled {
+    background-color: #0D1119;
+    border-color: #232B3B;
 }
 QWidget#Sidebar {
     background-color: #131722;
@@ -319,8 +364,12 @@ QLineEdit, QPlainTextEdit, QTextEdit, QTextBrowser, QListWidget, QComboBox, QSpi
     padding: 6px 10px;
     color: #F1F5F9;
 }
-QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {
+QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
     border-color: #F59E0B;
+}
+QComboBox::drop-down {
+    border: none;
+    width: 22px;
 }
 QComboBox QAbstractItemView {
     background-color: #141923;
@@ -399,6 +448,9 @@ QPushButton#NavIconBtn:hover {
     color: #F8FAFC;
 }
 """ + DARK_SCROLLBAR_QSS
+
+
+DASHBOARD_QSS = _build_dashboard_qss("Inter")
 
 
 class ContextDropListWidget(QListWidget):
@@ -517,7 +569,7 @@ class DashboardWindow(QWidget):
 
         self._build_ui(app_icon)
         self._setup_shortcuts()
-        self.setStyleSheet(DASHBOARD_QSS)
+        self.setStyleSheet(_build_dashboard_qss())
         self._populate_settings_from_config(self._config)
         self.refresh_readiness()
 
@@ -740,7 +792,7 @@ class DashboardWindow(QWidget):
     def _build_home_page(self) -> QWidget:
         page = QWidget(self)
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
 
         # First-run setup banner
@@ -764,11 +816,11 @@ class DashboardWindow(QWidget):
 
         # Top split: Hero card + Readiness checklist
         top_row = QHBoxLayout()
-        top_row.setSpacing(12)
+        top_row.setSpacing(10)
 
         hero = self._make_card(page)
         hero_l = QVBoxLayout(hero)
-        hero_l.setContentsMargins(16, 14, 16, 14)
+        hero_l.setContentsMargins(12, 12, 12, 12)
         hero_l.setSpacing(8)
 
         h_title = QLabel("Готові до захисту або зустрічі?", hero)
@@ -805,14 +857,16 @@ class DashboardWindow(QWidget):
         hero_l.addStretch(1)
 
         cta_row = QHBoxLayout()
-        cta_row.setSpacing(10)
+        cta_row.setSpacing(6)
         self._home_start_btn = QPushButton("▶ Почати сесію", hero)
         self._home_start_btn.setObjectName("PrimaryCTA")
         self._home_start_btn.setProperty("capturing", "false")
+        self._home_start_btn.setStyleSheet("padding: 8px 12px;")
         self._home_start_btn.clicked.connect(self._on_toggle_capture_clicked)
         cta_row.addWidget(self._home_start_btn)
 
         self._home_overlay_btn = QPushButton("Показати оверлей", hero)
+        self._home_overlay_btn.setStyleSheet("padding: 7px 10px;")
         self._home_overlay_btn.clicked.connect(self.toggle_overlay_requested.emit)
         cta_row.addWidget(self._home_overlay_btn)
         hero_l.addLayout(cta_row)
@@ -849,7 +903,7 @@ class DashboardWindow(QWidget):
 
         self._dot_llm, self._lbl_llm = self._add_check_row(ready_l, "Модель відповідей")
         llm_actions_row = QHBoxLayout()
-        llm_actions_row.setContentsMargins(114, 0, 0, 0)
+        llm_actions_row.setContentsMargins(90, 0, 0, 0)
         self._home_verify_btn = QPushButton("✓ Перевірити API-ключ", ready_card)
         self._home_verify_btn.setStyleSheet("padding: 3px 10px; font-size: 11px;")
         self._home_verify_btn.clicked.connect(self._on_home_verify_key_clicked)
@@ -868,7 +922,7 @@ class DashboardWindow(QWidget):
 
         # Bottom split: Privacy info + Hotkeys
         bottom_row = QHBoxLayout()
-        bottom_row.setSpacing(12)
+        bottom_row.setSpacing(10)
 
         priv_card = self._make_card(page)
         priv_l = QVBoxLayout(priv_card)
@@ -974,14 +1028,14 @@ class DashboardWindow(QWidget):
         self._live_start_btn = QPushButton("▶ Почати сесію", page)
         self._live_start_btn.setObjectName("PrimaryCTA")
         self._live_start_btn.setProperty("capturing", "false")
-        self._live_start_btn.setStyleSheet("padding: 7px 12px;")
+        self._live_start_btn.setStyleSheet("padding: 6px 10px;")
         self._live_start_btn.clicked.connect(self._on_toggle_capture_clicked)
         top_bar.addWidget(self._live_start_btn)
 
         self._live_web_btn = QPushButton("🌐 Веб", page)
         self._live_web_btn.setObjectName("LiveWebBtn")
         self._live_web_btn.setCheckable(True)
-        self._live_web_btn.setStyleSheet("padding: 6px 10px;")
+        self._live_web_btn.setStyleSheet("padding: 5px 8px;")
         self._live_web_btn.setToolTip(
             "Увімкнути / вимкнути пошук в інтернеті та веб-агента під час відповідей"
         )
@@ -991,7 +1045,7 @@ class DashboardWindow(QWidget):
         self._live_screen_btn = QPushButton("👁 Екран", page)
         self._live_screen_btn.setObjectName("LiveScreenBtn")
         self._live_screen_btn.setCheckable(True)
-        self._live_screen_btn.setStyleSheet("padding: 6px 10px;")
+        self._live_screen_btn.setStyleSheet("padding: 5px 8px;")
         self._live_screen_btn.setToolTip(
             "Зір екрана: прикріплювати знімок екрана (код в IDE / слайди)"
         )
@@ -999,7 +1053,7 @@ class DashboardWindow(QWidget):
         top_bar.addWidget(self._live_screen_btn)
 
         self._live_snip_btn = QPushButton("✂ Обл.", page)
-        self._live_snip_btn.setStyleSheet("padding: 6px 10px;")
+        self._live_snip_btn.setStyleSheet("padding: 5px 8px;")
         self._live_snip_btn.setToolTip(
             "Виділити область екрана (Ctrl+Alt+A) — графік, формула або фрагмент коду"
         )
@@ -1009,13 +1063,13 @@ class DashboardWindow(QWidget):
         top_bar.addStretch(1)
 
         live_export_btn = QPushButton("Експорт (.md)", page)
-        live_export_btn.setStyleSheet("padding: 6px 10px;")
+        live_export_btn.setStyleSheet("padding: 5px 8px;")
         live_export_btn.setToolTip("Зберегти транскрипт та всю сесію ШІ у файл")
         live_export_btn.clicked.connect(self._export_session_markdown)
         top_bar.addWidget(live_export_btn)
 
         live_clear_btn = QPushButton("Очистити", page)
-        live_clear_btn.setStyleSheet("padding: 6px 10px;")
+        live_clear_btn.setStyleSheet("padding: 5px 8px;")
         live_clear_btn.clicked.connect(self.clear_all_requested.emit)
         top_bar.addWidget(live_clear_btn)
         layout.addLayout(top_bar)
@@ -1517,15 +1571,21 @@ class DashboardWindow(QWidget):
         form.setSpacing(12)
 
         self._ov_stealth_chk = QCheckBox(
-            "Stealth-режим оверлею (WDA_EXCLUDEFROMCAPTURE — невидимий при шарингу екрана)",
+            "Stealth-режим оверлею (невидимий при шарингу екрана)",
             tab,
+        )
+        self._ov_stealth_chk.setToolTip(
+            "Використовує Windows WDA_EXCLUDEFROMCAPTURE для приховування оверлею на дзвінках та записах."
         )
         self._ov_stealth_chk.clicked.connect(self._on_ov_stealth_checkbox_clicked)
         form.addRow("Оверлей:", self._ov_stealth_chk)
 
         self._dash_stealth_chk = QCheckBox(
-            "Stealth-режим панелі керування (також ховати головне вікно від запису екрана)",
+            "Stealth-режим панелі керування (ховати від запису екрана)",
             tab,
+        )
+        self._dash_stealth_chk.setToolTip(
+            "Застосовує WDA_EXCLUDEFROMCAPTURE також до головного вікна панелі керування."
         )
         self._dash_stealth_chk.clicked.connect(self._on_dash_stealth_checkbox_clicked)
         form.addRow("Панель:", self._dash_stealth_chk)

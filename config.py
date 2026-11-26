@@ -87,9 +87,65 @@ def is_dir_writable(path: Path) -> bool:
         return False
 
 
-def get_env_file_path() -> Path:
-    """Return writable `.env` path next to app/exe, falling back to %APPDATA% if needed."""
+def _get_appdata_dir() -> Path:
+    """Return per-user %APPDATA%\\ZoomAICopilot directory, creating it if needed."""
+    appdata_dir = Path(os.getenv("APPDATA", str(Path.home()))) / "ZoomAICopilot"
+    appdata_dir.mkdir(parents=True, exist_ok=True)
+    return appdata_dir
+
+
+def is_under_program_files(path: Path) -> bool:
+    """Return True if `path` resides inside any Windows Program Files directory."""
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        resolved = Path(path)
+    norm_target = os.path.normcase(os.path.normpath(str(resolved)))
+    for env_var in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        raw_root = os.getenv(env_var, "").strip()
+        if not raw_root:
+            continue
+        try:
+            root_resolved = Path(raw_root).resolve()
+        except OSError:
+            root_resolved = Path(raw_root)
+        norm_root = os.path.normcase(os.path.normpath(str(root_resolved)))
+        if norm_target == norm_root or norm_target.startswith(norm_root.rstrip("\\/") + os.sep):
+            return True
+    return False
+
+
+def _migrate_legacy_runtime_file(src: Path, dst: Path) -> None:
+    """Best-effort one-time copy of a runtime file into %APPDATA% without logging contents."""
+    try:
+        if dst.exists() or not src.is_file():
+            return
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(src.read_bytes())
+    except OSError:
+        pass
+
+
+def get_runtime_data_dir() -> Path:
+    """Return consistent writable directory for logs, profiles, and runtime state."""
     app_dir = get_app_dir()
+    if not is_under_program_files(app_dir) and is_dir_writable(app_dir):
+        return app_dir
+    appdata_dir = _get_appdata_dir()
+    if is_under_program_files(app_dir):
+        for fname in ("prompt_profiles.json", "context_sources.json"):
+            _migrate_legacy_runtime_file(app_dir / fname, appdata_dir / fname)
+    return appdata_dir
+
+
+def get_env_file_path() -> Path:
+    """Return writable `.env` path next to app/exe, or always %APPDATA% under Program Files."""
+    app_dir = get_app_dir()
+    if is_under_program_files(app_dir):
+        target_env = _get_appdata_dir() / ".env"
+        _migrate_legacy_runtime_file(app_dir / ".env", target_env)
+        return target_env
+
     app_env = app_dir / ".env"
     if app_env.is_file():
         try:
@@ -101,9 +157,7 @@ def get_env_file_path() -> Path:
     elif is_dir_writable(app_dir):
         return app_env
 
-    appdata_dir = Path(os.getenv("APPDATA", str(Path.home()))) / "ZoomAICopilot"
-    appdata_dir.mkdir(parents=True, exist_ok=True)
-    return appdata_dir / ".env"
+    return _get_appdata_dir() / ".env"
 
 
 def parse_custom_vocabulary(raw: str) -> list[str]:

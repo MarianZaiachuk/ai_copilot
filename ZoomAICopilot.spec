@@ -20,6 +20,14 @@ datas = [
     (str(ROOT / "assets" / "icon.png"), "assets"),
     (str(ROOT / "assets" / "icon.ico"), "assets"),
 ]
+_check_png = ROOT / "assets" / "check.png"
+if _check_png.is_file():
+    datas.append((str(_check_png), "assets"))
+_fonts_dir = ROOT / "assets" / "fonts"
+if _fonts_dir.is_dir():
+    for _font_file in sorted(_fonts_dir.iterdir()):
+        if _font_file.is_file() and _font_file.suffix.lower() in {".ttf", ".otf"}:
+            datas.append((str(_font_file), "assets/fonts"))
 datas += collect_data_files("faster_whisper")
 datas += collect_data_files("certifi")
 datas += collect_data_files("docx")
