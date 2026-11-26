@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+
+PRESERVED_RUNTIME_FILES: tuple[str, ...] = (
+    ".env",
+    "prompt_profiles.json",
+    "context_sources.json",
+)
+BACKUP_NON_SECRET_FILES: tuple[str, ...] = (
+    "prompt_profiles.json",
+    "context_sources.json",
+)
 
 
 def _ps_quote(value: str) -> str:
@@ -47,6 +58,48 @@ def _needs_icon_rebuild(root: Path, icon_png: Path, icon_ico: Path) -> bool:
     return False
 
 
+def _snapshot_runtime_files(dist_dir: Path) -> dict[str, bytes]:
+    """Capture user runtime files (.env, profiles, context sources) before PyInstaller wipes dist."""
+    snapshot: dict[str, bytes] = {}
+    for fname in PRESERVED_RUNTIME_FILES:
+        src = dist_dir / fname
+        if src.is_file():
+            snapshot[fname] = src.read_bytes()
+    return snapshot
+
+
+def _restore_runtime_files(dist_dir: Path, snapshot: dict[str, bytes]) -> list[str]:
+    """Restore previously snapshotted runtime files into `dist_dir`."""
+    restored: list[str] = []
+    if not dist_dir.is_dir():
+        return restored
+    for fname, raw_bytes in snapshot.items():
+        dst = dist_dir / fname
+        dst.write_bytes(raw_bytes)
+        restored.append(fname)
+    return restored
+
+
+def _backup_profile_files(
+    snapshot: dict[str, bytes],
+    backup_dir: Path | None = None,
+) -> list[Path]:
+    """Save non-secret profile/context backups into %APPDATA%\\ZoomAICopilot\\backups."""
+    target_dir = backup_dir or (
+        Path(os.getenv("APPDATA", str(Path.home()))) / "ZoomAICopilot" / "backups"
+    )
+    written: list[Path] = []
+    for fname in BACKUP_NON_SECRET_FILES:
+        raw_bytes = snapshot.get(fname)
+        if raw_bytes is None:
+            continue
+        target_dir.mkdir(parents=True, exist_ok=True)
+        dst = target_dir / fname
+        dst.write_bytes(raw_bytes)
+        written.append(dst)
+    return written
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Build ZoomAICopilot Windows executable.")
     parser.add_argument(
@@ -73,9 +126,13 @@ def main(argv: list[str] | None = None) -> int:
 
     dist_dir = root / "dist" / "ZoomAICopilot"
     dist_env = dist_dir / ".env"
-    preserved_env_bytes: bytes | None = None
-    if dist_env.is_file():
-        preserved_env_bytes = dist_env.read_bytes()
+    preserved_snapshot = _snapshot_runtime_files(dist_dir)
+    backed_up = _backup_profile_files(preserved_snapshot)
+    if backed_up:
+        print(
+            "Backed up non-secret profile state:",
+            ", ".join(str(p) for p in backed_up),
+        )
 
     spec_path = root / "ZoomAICopilot.spec"
     cmd = [
@@ -96,6 +153,10 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return exc.returncode or 1
+    finally:
+        restored = _restore_runtime_files(dist_dir, preserved_snapshot)
+        if restored:
+            print("Preserved runtime files in dist/ZoomAICopilot:", ", ".join(restored))
 
     exe_path = dist_dir / "ZoomAICopilot.exe"
     if not exe_path.is_file():
@@ -105,10 +166,7 @@ def main(argv: list[str] | None = None) -> int:
     if env_example.is_file():
         shutil.copy2(env_example, dist_dir / ".env.example")
 
-    if preserved_env_bytes is not None:
-        dist_env.write_bytes(preserved_env_bytes)
-        print("Preserved existing dist/ZoomAICopilot/.env")
-    elif args.copy_env:
+    if ".env" not in preserved_snapshot and args.copy_env:
         local_env = root / ".env"
         if local_env.is_file() and not dist_env.is_file():
             shutil.copy2(local_env, dist_env)

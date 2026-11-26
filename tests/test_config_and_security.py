@@ -306,3 +306,33 @@ def test_profile_store_migration_crud_and_persistence(tmp_path: Path) -> None:
 def test_is_dir_writable_probe(tmp_path: Path) -> None:
     assert config.is_dir_writable(tmp_path) is True
     assert config.is_dir_writable(tmp_path / "missing") is False
+
+
+def test_build_exe_preserves_runtime_files_and_backups_without_secrets(tmp_path: Path) -> None:
+    import shutil
+    import build_exe
+
+    dist_dir = tmp_path / "dist" / "ZoomAICopilot"
+    dist_dir.mkdir(parents=True)
+    (dist_dir / ".env").write_text("OPENAI_API_KEY=sk-secret-keep\n", encoding="utf-8")
+    (dist_dir / "prompt_profiles.json").write_text('{"profiles":[{"name":"Test"}]}', encoding="utf-8")
+    (dist_dir / "context_sources.json").write_text('{"paths":["doc.md"]}', encoding="utf-8")
+
+    snapshot = build_exe._snapshot_runtime_files(dist_dir)
+    assert set(snapshot) == {".env", "prompt_profiles.json", "context_sources.json"}
+
+    backup_dir = tmp_path / "appdata_backups"
+    written = build_exe._backup_profile_files(snapshot, backup_dir=backup_dir)
+    assert len(written) == 2
+    assert (backup_dir / "prompt_profiles.json").is_file()
+    assert (backup_dir / "context_sources.json").is_file()
+    assert not (backup_dir / ".env").exists()
+
+    # Simulate PyInstaller wiping dist_dir and recreating clean folder
+    shutil.rmtree(dist_dir)
+    dist_dir.mkdir(parents=True)
+    restored = build_exe._restore_runtime_files(dist_dir, snapshot)
+    assert set(restored) == {".env", "prompt_profiles.json", "context_sources.json"}
+    assert "sk-secret-keep" in (dist_dir / ".env").read_text(encoding="utf-8")
+    assert '"Test"' in (dist_dir / "prompt_profiles.json").read_text(encoding="utf-8")
+    assert '"doc.md"' in (dist_dir / "context_sources.json").read_text(encoding="utf-8")
