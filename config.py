@@ -21,6 +21,7 @@ from security import register_secret
 VALID_LLM_PROVIDERS: frozenset[str] = frozenset(
     {"openai", "groq", "cerebras", "gemini", "ollama", "lmstudio"}
 )
+VALID_FALLBACK_PROVIDERS: frozenset[str] = frozenset({"auto", "none"}) | VALID_LLM_PROVIDERS
 VALID_WHISPER_DEVICES: frozenset[str] = frozenset({"cuda", "cpu", "auto"})
 VALID_STT_PROVIDERS: frozenset[str] = frozenset({"local", "deepgram", "groq", "elevenlabs"})
 VALID_SEARCH_PROVIDERS: frozenset[str] = frozenset(
@@ -292,6 +293,7 @@ class AppConfig:
     cerebras_model: str = ""
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.8-flash"
+    llm_fallback_provider: str = "auto"
     llm_temperature: float = 0.2
     llm_max_tokens: int = 512
 
@@ -318,6 +320,7 @@ class AppConfig:
     hotkey_screen: str = "ctrl+alt+s"
     hotkey_web: str = "ctrl+alt+w"
     hotkey_capture: str = "ctrl+alt+r"
+    hotkey_snip: str = "ctrl+alt+a"
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
 
     overlay_opacity: int = 92
@@ -443,6 +446,11 @@ def load_config(env_path: str | None = None, override: bool = False) -> AppConfi
     raw_llm_prov = _env_str("LLM_PROVIDER", "openai").lower()
     llm_provider = raw_llm_prov if raw_llm_prov in VALID_LLM_PROVIDERS else "openai"
 
+    raw_fallback_prov = _env_str("LLM_FALLBACK_PROVIDER", "auto").lower()
+    llm_fallback_provider = (
+        raw_fallback_prov if raw_fallback_prov in VALID_FALLBACK_PROVIDERS else "auto"
+    )
+
     raw_whisper_dev = _env_str("WHISPER_DEVICE", "cuda").lower()
     whisper_device = raw_whisper_dev if raw_whisper_dev in VALID_WHISPER_DEVICES else "cuda"
 
@@ -482,6 +490,7 @@ def load_config(env_path: str | None = None, override: bool = False) -> AppConfi
         cerebras_model=cerebras_model,
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
         gemini_model=_env_str("GEMINI_MODEL", "gemini-3.8-flash"),
+        llm_fallback_provider=llm_fallback_provider,
         llm_temperature=_parse_float(
             os.getenv("LLM_TEMPERATURE"), 0.2, minimum=0.0, maximum=2.0
         ),
@@ -521,6 +530,7 @@ def load_config(env_path: str | None = None, override: bool = False) -> AppConfi
         hotkey_screen=_env_str("HOTKEY_SCREEN", "ctrl+alt+s").lower(),
         hotkey_web=_env_str("HOTKEY_WEB", "ctrl+alt+w").lower(),
         hotkey_capture=_env_str("HOTKEY_CAPTURE", "ctrl+alt+r").lower(),
+        hotkey_snip=_env_str("HOTKEY_SNIP", "ctrl+alt+a").lower(),
         system_prompt=system_prompt,
         overlay_opacity=_parse_int(
             os.getenv("OVERLAY_OPACITY"), 92, minimum=30, maximum=100
@@ -597,6 +607,14 @@ def save_config_to_env(config: AppConfig, env_path: Path | None = None) -> Path:
         ("CEREBRAS_MODEL", config.cerebras_model.strip()),
         ("GEMINI_API_KEY", config.gemini_api_key.strip()),
         ("GEMINI_MODEL", config.gemini_model.strip()),
+        (
+            "LLM_FALLBACK_PROVIDER",
+            (
+                config.llm_fallback_provider.strip().lower()
+                if config.llm_fallback_provider.strip().lower() in VALID_FALLBACK_PROVIDERS
+                else "auto"
+            ),
+        ),
         ("LLM_TEMPERATURE", f"{config.llm_temperature:.2f}"),
         ("LLM_MAX_TOKENS", str(config.llm_max_tokens)),
         ("WHISPER_MODEL", config.whisper_model.strip()),
@@ -620,6 +638,7 @@ def save_config_to_env(config: AppConfig, env_path: Path | None = None) -> Path:
         ("HOTKEY_SCREEN", config.hotkey_screen.strip().lower()),
         ("HOTKEY_WEB", config.hotkey_web.strip().lower()),
         ("HOTKEY_CAPTURE", config.hotkey_capture.strip().lower()),
+        ("HOTKEY_SNIP", config.hotkey_snip.strip().lower()),
         ("OVERLAY_OPACITY", str(config.overlay_opacity)),
         ("OVERLAY_STEALTH", "true" if config.overlay_stealth else "false"),
         ("DASHBOARD_STEALTH", "true" if config.dashboard_stealth else "false"),
@@ -908,3 +927,125 @@ class ProfileStore:
             self.active_profile_id = self.profiles[fallback_idx].id
         self.save()
         return self.active_profile()
+
+    def export_profiles_payload(self, profile_ids: list[str] | None = None) -> dict[str, Any]:
+        """Build a secret-free portable JSON payload for sharing profiles."""
+        if profile_ids:
+            id_set = set(profile_ids)
+            selected = [p for p in self.profiles if p.id in id_set]
+        else:
+            selected = list(self.profiles)
+        return {
+            "format": "zoom_ai_copilot_profiles",
+            "version": 1,
+            "profiles": [
+                {
+                    "name": p.name,
+                    "system_prompt": p.system_prompt,
+                    "stt_language": p.stt_language,
+                    "custom_vocabulary": p.custom_vocabulary,
+                    "doc_names": [Path(path_str).name for path_str in p.context_paths if path_str],
+                }
+                for p in selected
+            ],
+        }
+
+    def export_to_file(self, path: Path, profile_ids: list[str] | None = None) -> int:
+        """Atomically export selected (or all) profiles without secrets or local paths."""
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = self.export_profiles_payload(profile_ids=profile_ids)
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        tmp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(target.parent),
+                prefix=".prof_export.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                tmp_path = Path(handle.name)
+                handle.write(serialized)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, target)
+        except Exception:
+            if tmp_path is not None and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            raise
+        return len(payload["profiles"])
+
+    def _unique_import_name(self, base_name: str, used_names: set[str]) -> str:
+        clean = base_name.strip() or "Імпортований профіль"
+        if clean.lower() not in used_names:
+            used_names.add(clean.lower())
+            return clean
+        candidate = f"{clean} (імпорт)"
+        if candidate.lower() not in used_names:
+            used_names.add(candidate.lower())
+            return candidate
+        idx = 2
+        while f"{clean} (імпорт {idx})".lower() in used_names:
+            idx += 1
+        final_name = f"{clean} (імпорт {idx})"
+        used_names.add(final_name.lower())
+        return final_name
+
+    def import_from_payload(self, payload: Any) -> list[PromptProfile]:
+        """Validate and import one or more portable profiles, activating the first imported."""
+        if isinstance(payload, dict) and isinstance(payload.get("profiles"), list):
+            raw_items = payload["profiles"]
+        elif isinstance(payload, dict) and "name" in payload and "system_prompt" in payload:
+            raw_items = [payload]
+        elif isinstance(payload, list):
+            raw_items = payload
+        else:
+            raise ValueError("Некоректний формат файлу профілів (очікується JSON із профілями).")
+
+        used_names = {p.name.strip().lower() for p in self.profiles}
+        existing_ids = {p.id for p in self.profiles}
+        imported: list[PromptProfile] = []
+
+        for entry in raw_items:
+            if not isinstance(entry, dict):
+                continue
+            raw_name = str(entry.get("name") or "").strip()
+            raw_prompt = str(entry.get("system_prompt") or "").strip()
+            if not raw_name and not raw_prompt:
+                continue
+            new_id = f"profile-{uuid.uuid4().hex[:8]}"
+            while new_id in existing_ids:
+                new_id = f"profile-{uuid.uuid4().hex[:8]}"
+            existing_ids.add(new_id)
+
+            prof = PromptProfile(
+                id=new_id,
+                name=self._unique_import_name(raw_name, used_names),
+                system_prompt=raw_prompt or DEFAULT_SYSTEM_PROMPT,
+                stt_language=self._sanitize_lang(entry.get("stt_language", "uk")),
+                custom_vocabulary=str(entry.get("custom_vocabulary") or "").strip(),
+                context_paths=[],
+            )
+            self.profiles.append(prof)
+            imported.append(prof)
+
+        if not imported:
+            raise ValueError("У вибраному файлі не знайдено жодного валідного профілю.")
+
+        self.active_profile_id = imported[0].id
+        self.save()
+        return imported
+
+    def import_from_file(self, path: Path) -> list[PromptProfile]:
+        """Read JSON profile bundle from disk and import profiles into the store."""
+        source = Path(path)
+        try:
+            raw_data = json.loads(source.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Не вдалося прочитати JSON профілю: {exc}") from exc
+        return self.import_from_payload(raw_data)

@@ -84,6 +84,8 @@ hiddenimports = (
         "docx",
         "dotenv",
         "screen_capture",
+        "latex_renderer",
+        "diagnostics",
         "web_search",
         "ddgs",
         "primp",

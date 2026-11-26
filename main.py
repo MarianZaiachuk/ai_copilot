@@ -209,25 +209,122 @@ def _setup_logging_and_streams() -> None:
 
 _setup_logging_and_streams()
 
-from PyQt6.QtCore import QCoreApplication, QObject, Qt, QThread, QTimer, pyqtSignal  # noqa: E402
-from PyQt6.QtGui import QAction, QActionGroup, QGuiApplication, QIcon  # noqa: E402
-from PyQt6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
-from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon  # noqa: E402
-from pynput import keyboard  # noqa: E402
+_STARTUP_SENTINEL_NAME = ".startup_in_progress"
 
-from audio_capture import WasapiLoopbackCapturer, list_loopback_devices  # noqa: E402
-from context_loader import ContextManager, expand_context_paths  # noqa: E402
-from dashboard import DashboardWindow  # noqa: E402
-from llm_client import ApiKeyCheckResult, LLMClient  # noqa: E402
-from screen_capture import capture_screen, list_screens  # noqa: E402
-from transcriber import (  # noqa: E402
-    CloudSTTTranscriber,
-    DeepgramRealtimeClient,
-    WhisperTranscriber,
-    verify_stt_provider,
-)
-from ui import CopilotOverlayWindow, apply_window_display_affinity  # noqa: E402
-from web_search import search_web  # noqa: E402
+
+def _startup_sentinel_path() -> Path:
+    return _get_runtime_data_dir() / _STARTUP_SENTINEL_NAME
+
+
+def _apply_software_rendering_env_if_needed(
+    argv: list[str] | None = None,
+    sentinel_path: Path | None = None,
+) -> bool:
+    """Enable Qt software rendering on --software, env override, or prior startup crash."""
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    sentinel = sentinel_path or _startup_sentinel_path()
+    forced = (
+        "--software" in args_list
+        or os.getenv("ZOOM_COPILOT_SOFTWARE_GL", "").strip().lower() in {"1", "true", "yes"}
+    )
+    recovered = (
+        sentinel.is_file()
+        and "--smoke-test" not in args_list
+        and not os.getenv("PYTEST_CURRENT_TEST")
+    )
+    if not forced and not recovered:
+        return False
+
+    os.environ.setdefault("QT_OPENGL", "software")
+    os.environ.setdefault("QSG_RHI_BACKEND", "software")
+    os.environ.setdefault("QT_QUICK_BACKEND", "software")
+    reason = "--software / env" if forced else "previous incomplete startup"
+    logging.getLogger(__name__).warning("[startup] Qt software rendering enabled (%s)", reason)
+    return True
+
+
+def _early_install_crash_hook() -> None:
+    prev_hook = sys.excepthook
+
+    def _on_unhandled_exception(exc_type, exc_value, exc_tb) -> None:
+        logging.getLogger(__name__).critical(
+            "Unhandled exception", exc_info=(exc_type, exc_value, exc_tb)
+        )
+        log_hint = f"\n\nЛог: {_LOG_FILE_PATH}" if _LOG_FILE_PATH else ""
+        _show_startup_message(
+            "AI Copilot — Помилка",
+            f"Виникла непередбачена помилка:\n{exc_value}{log_hint}",
+            is_error=True,
+        )
+        if prev_hook is not None:
+            prev_hook(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _on_unhandled_exception
+
+
+if __name__ == "__main__" and "--diagnose" in sys.argv:
+    from diagnostics import run_diagnostics as _early_run_diagnostics
+
+    _diag_out = ""
+    for _idx, _arg in enumerate(sys.argv):
+        if _arg == "--diagnose-out" and _idx + 1 < len(sys.argv):
+            _diag_out = sys.argv[_idx + 1]
+            break
+    _early_run_diagnostics(
+        write_report=True,
+        show_dialog=("--smoke-test" not in sys.argv),
+        out_path=_diag_out or None,
+    )
+    sys.exit(0)
+
+_early_install_crash_hook()
+_SOFTWARE_RENDERING_ACTIVE = _apply_software_rendering_env_if_needed()
+
+try:
+    from PyQt6.QtCore import QCoreApplication, QObject, Qt, QThread, QTimer, pyqtSignal  # noqa: E402
+    from PyQt6.QtGui import QAction, QActionGroup, QGuiApplication, QIcon  # noqa: E402
+    from PyQt6.QtNetwork import QLocalServer, QLocalSocket  # noqa: E402
+    from PyQt6.QtWidgets import QApplication, QLabel, QMenu, QSystemTrayIcon, QVBoxLayout, QWidget  # noqa: E402
+    from pynput import keyboard  # noqa: E402
+
+    from audio_capture import WasapiLoopbackCapturer, list_loopback_devices  # noqa: E402
+    from context_loader import ContextManager, expand_context_paths  # noqa: E402
+    from dashboard import DashboardWindow  # noqa: E402
+    from diagnostics import run_diagnostics  # noqa: E402
+    from llm_client import ApiKeyCheckResult, LLMClient  # noqa: E402
+    from screen_capture import (  # noqa: E402
+        ScreenCaptureResult,
+        ScreenSnipOverlay,
+        capture_screen,
+        list_screens,
+    )
+    from transcriber import (  # noqa: E402
+        CloudSTTTranscriber,
+        DeepgramRealtimeClient,
+        WhisperTranscriber,
+        verify_stt_provider,
+    )
+    from ui import CopilotOverlayWindow, apply_window_display_affinity  # noqa: E402
+    from web_search import search_web  # noqa: E402
+except Exception as _import_exc:
+    logging.getLogger(__name__).critical(
+        "Fatal import error during startup: %s", _import_exc, exc_info=True
+    )
+    if not os.getenv("PYTEST_CURRENT_TEST") and "--smoke-test" not in sys.argv:
+        _log_hint = f"\n\nЛог запуску: {_LOG_FILE_PATH}" if _LOG_FILE_PATH else ""
+        _show_startup_message(
+            "AI Copilot — Помилка запуску",
+            "Не вдалося завантажити компоненти програми:\n"
+            f"{_import_exc}\n\n"
+            "Рекомендації:\n"
+            "• Встановіть Visual C++ Redistributable 2015–2022 (x64).\n"
+            "• Запустіть «Діагностика» (--diagnose) або «Режим сумісності» (--software)."
+            f"{_log_hint}",
+            is_error=True,
+        )
+        if __name__ == "__main__":
+            sys.exit(1)
+    raise
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +421,7 @@ class GlobalHotkeyBridge(QObject):
     screen_hotkey_pressed = pyqtSignal()
     web_hotkey_pressed = pyqtSignal()
     capture_hotkey_pressed = pyqtSignal()
+    snip_hotkey_pressed = pyqtSignal()
 
     def __init__(
         self,
@@ -332,6 +430,7 @@ class GlobalHotkeyBridge(QObject):
         screen_spec: str = "ctrl+alt+s",
         web_spec: str = "ctrl+alt+w",
         capture_spec: str = "ctrl+alt+r",
+        snip_spec: str = "ctrl+alt+a",
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -341,6 +440,7 @@ class GlobalHotkeyBridge(QObject):
             screen_spec=screen_spec,
             web_spec=web_spec,
             capture_spec=capture_spec,
+            snip_spec=snip_spec,
         )
         (
             self._answer_combo,
@@ -348,6 +448,7 @@ class GlobalHotkeyBridge(QObject):
             self._screen_combo,
             self._web_combo,
             self._capture_combo,
+            self._snip_combo,
         ) = combos
 
         self._lock = threading.Lock()
@@ -363,7 +464,9 @@ class GlobalHotkeyBridge(QObject):
         screen_spec: str,
         web_spec: str,
         capture_spec: str,
+        snip_spec: str,
     ) -> tuple[
+        tuple[frozenset[str], int],
         tuple[frozenset[str], int],
         tuple[frozenset[str], int],
         tuple[frozenset[str], int],
@@ -375,9 +478,10 @@ class GlobalHotkeyBridge(QObject):
         scr = parse_hotkey_spec(screen_spec)
         web = parse_hotkey_spec(web_spec)
         cap = parse_hotkey_spec(capture_spec)
-        if len({ans, tog, scr, web, cap}) < 5:
+        snp = parse_hotkey_spec(snip_spec)
+        if len({ans, tog, scr, web, cap, snp}) < 6:
             raise ValueError("Гарячі клавіші не можуть збігатися")
-        return ans, tog, scr, web, cap
+        return ans, tog, scr, web, cap, snp
 
     def update_hotkeys(
         self,
@@ -386,13 +490,15 @@ class GlobalHotkeyBridge(QObject):
         screen_spec: str | None = None,
         web_spec: str | None = None,
         capture_spec: str | None = None,
+        snip_spec: str | None = None,
     ) -> None:
         new_ans = parse_hotkey_spec(answer_spec)
         new_tog = parse_hotkey_spec(toggle_spec)
         new_scr = parse_hotkey_spec(screen_spec) if screen_spec is not None else self._screen_combo
         new_web = parse_hotkey_spec(web_spec) if web_spec is not None else self._web_combo
         new_cap = parse_hotkey_spec(capture_spec) if capture_spec is not None else self._capture_combo
-        if len({new_ans, new_tog, new_scr, new_web, new_cap}) < 5:
+        new_snp = parse_hotkey_spec(snip_spec) if snip_spec is not None else self._snip_combo
+        if len({new_ans, new_tog, new_scr, new_web, new_cap, new_snp}) < 6:
             raise ValueError("Гарячі клавіші не можуть збігатися")
         with self._lock:
             self._answer_combo = new_ans
@@ -400,6 +506,7 @@ class GlobalHotkeyBridge(QObject):
             self._screen_combo = new_scr
             self._web_combo = new_web
             self._capture_combo = new_cap
+            self._snip_combo = new_snp
             self._fired_vks.clear()
 
     def start(self) -> None:
@@ -530,6 +637,9 @@ class GlobalHotkeyBridge(QObject):
             elif (current_mods, vk) == self._capture_combo:
                 self._fired_vks.add(vk)
                 pending_signal = self.capture_hotkey_pressed
+            elif (current_mods, vk) == self._snip_combo:
+                self._fired_vks.add(vk)
+                pending_signal = self.snip_hotkey_pressed
 
         if pending_signal is not None:
             pending_signal.emit()
@@ -1247,6 +1357,7 @@ class CopilotController(QObject):
         self._web_test_thread: WebSearchTestThread | None = None
         self._stt_test_thread: STTTestThread | None = None
         self._device_refresh_thread: DeviceRefreshThread | None = None
+        self._snip_overlay: ScreenSnipOverlay | None = None
 
         self._transcriber_thread = self._create_transcriber_thread(self.config)
 
@@ -1256,6 +1367,7 @@ class CopilotController(QObject):
             screen_spec=self.config.hotkey_screen,
             web_spec=self.config.hotkey_web,
             capture_spec=self.config.hotkey_capture,
+            snip_spec=self.config.hotkey_snip,
             parent=self,
         )
         self._hotkey_bridge.answer_hotkey_pressed.connect(self._on_answer_hotkey)
@@ -1263,6 +1375,7 @@ class CopilotController(QObject):
         self._hotkey_bridge.screen_hotkey_pressed.connect(self.toggle_screen_vision)
         self._hotkey_bridge.web_hotkey_pressed.connect(self.toggle_web_search)
         self._hotkey_bridge.capture_hotkey_pressed.connect(self.toggle_capture)
+        self._hotkey_bridge.snip_hotkey_pressed.connect(self.trigger_snip_answer)
 
         self._tray_icon: QSystemTrayIcon | None = None
         self._tray_menu: QMenu | None = None
@@ -1354,6 +1467,10 @@ class CopilotController(QObject):
         self._tray_screen_action.toggled.connect(self.set_screen_vision_enabled)
         menu.addAction(self._tray_screen_action)
 
+        act_snip = QAction("✂ Виділити область екрана", menu)
+        act_snip.triggered.connect(self.trigger_snip_answer)
+        menu.addAction(act_snip)
+
         self._tray_stealth_action = QAction(menu)
         self._tray_stealth_action.setCheckable(False)
         self._tray_stealth_action.setEnabled(False)
@@ -1427,6 +1544,8 @@ class CopilotController(QObject):
         self.overlay.cancel_answer_requested.connect(self.cancel_answer)
         self.overlay.deep_answer_requested.connect(self.trigger_deep_answer)
         self.overlay.qa_nav_requested.connect(self.navigate_qa)
+        self.overlay.qa_jump_requested.connect(self.jump_to_qa)
+        self.overlay.snip_requested.connect(self.trigger_snip_answer)
         self.overlay.device_selected.connect(self.dashboard.set_selected_device_index)
         self.overlay.opacity_changed.connect(self._on_overlay_opacity_changed)
         self.overlay.web_search_toggled.connect(self.set_web_search_enabled)
@@ -1448,6 +1567,8 @@ class CopilotController(QObject):
         self.dashboard.cancel_answer_requested.connect(self.cancel_answer)
         self.dashboard.deep_answer_requested.connect(self.trigger_deep_answer)
         self.dashboard.qa_nav_requested.connect(self.navigate_qa)
+        self.dashboard.qa_jump_requested.connect(self.jump_to_qa)
+        self.dashboard.snip_requested.connect(self.trigger_snip_answer)
         self.dashboard.device_selected.connect(self.overlay.set_selected_device_index)
         self.dashboard.web_search_toggled.connect(self.set_web_search_enabled)
         self.dashboard.screen_vision_toggled.connect(self.set_screen_vision_enabled)
@@ -1462,6 +1583,9 @@ class CopilotController(QObject):
         self.dashboard.profile_rename_requested.connect(self.rename_profile)
         self.dashboard.profile_delete_requested.connect(self.delete_profile)
         self.dashboard.profile_language_changed.connect(self.update_profile_language)
+        self.dashboard.profile_export_requested.connect(self.export_profiles)
+        self.dashboard.profile_import_requested.connect(self.import_profiles)
+        self.dashboard.run_diagnostics_requested.connect(self.run_ui_diagnostics)
         self.dashboard.quit_requested.connect(self.request_quit)
         self.dashboard.minimized_to_tray.connect(self._on_dashboard_minimized)
 
@@ -1862,6 +1986,67 @@ class CopilotController(QObject):
             f"Мову STT профілю «{prof.name}» оновлено: {lang_code or 'не змінювати'}."
         )
 
+    def export_profiles(self, path_str: str, export_all: bool = False) -> None:
+        if self._shutting_down or not path_str:
+            return
+        self._flush_active_profile_drafts()
+        active = self._profile_store.active_profile()
+        ids = None if export_all else [active.id]
+        try:
+            count = self._profile_store.export_to_file(Path(path_str), profile_ids=ids)
+            self.dashboard.show_docs_status(
+                f"Експортовано профілів: {count} → {Path(path_str).name} (без ключів і шляхів)."
+            )
+        except Exception as exc:
+            self.dashboard.show_docs_status(f"Помилка експорту профілів: {exc}", is_error=True)
+
+    def import_profiles(self, path_str: str) -> None:
+        if self._shutting_down or not path_str:
+            return
+        self._flush_active_profile_drafts()
+        try:
+            imported = self._profile_store.import_from_file(Path(path_str))
+        except Exception as exc:
+            self.dashboard.show_docs_status(f"Помилка імпорту: {exc}", is_error=True)
+            return
+
+        first = imported[0]
+        next_lang = first.stt_language if first.stt_language else self.config.whisper_language
+        updated_cfg = replace(
+            self.config,
+            system_prompt=first.system_prompt,
+            custom_vocabulary=first.custom_vocabulary,
+            whisper_language=next_lang,
+        )
+        self.apply_new_settings(updated_cfg, sync_active_profile=False)
+        self._transcriber_thread.reset_history()
+        self.dashboard.sync_profile_state(
+            self.config, self._profile_store.profiles, first.id
+        )
+        self._rebuild_tray_profiles_menu()
+        self._start_context_worker("replace", [])
+        self.dashboard.show_docs_status(
+            f"Імпортовано профілів: {len(imported)}. Активовано «{first.name}»."
+        )
+
+    def run_ui_diagnostics(self) -> None:
+        if self._shutting_down:
+            return
+        try:
+            report = run_diagnostics(write_report=True, show_dialog=True)
+            issues = report.get("issues") or []
+            if issues:
+                self.dashboard.show_settings_error(
+                    f"Діагностика: {report.get('summary')} (див. diagnostics_report.txt)"
+                )
+            else:
+                self.dashboard._save_status_lbl.setStyleSheet("color: #4ADE80;")
+                self.dashboard._save_status_lbl.setText(
+                    f"{report.get('summary')} · звіт: diagnostics_report.txt"
+                )
+        except Exception as exc:
+            self.dashboard.show_settings_error(f"Помилка діагностики: {exc}")
+
     def _save_context_sources(self, *, update_active_profile: bool = True) -> None:
         paths = [doc.path for doc in self.context_manager.documents]
         if update_active_profile:
@@ -1978,12 +2163,30 @@ class CopilotController(QObject):
         current = self._qa_index + 1 if 0 <= self._qa_index < total else 0
         self.overlay.set_qa_history_position(current, total)
         self.dashboard.set_qa_history_position(current, total)
+        nav_items = [(entry.timestamp, entry.question) for entry in self._qa_history]
+        self.overlay.set_qa_history_items(nav_items, self._qa_index)
+        self.dashboard.set_qa_history_items(nav_items, self._qa_index)
         export_rows = [
             (entry.timestamp, entry.question, entry.answer, list(entry.sources))
             for entry in self._qa_history
             if entry.answer.strip()
         ]
         self.dashboard.set_qa_history_entries(export_rows)
+
+    def jump_to_qa(self, index: int) -> None:
+        total = len(self._qa_history)
+        if total <= 0:
+            return
+        nxt = max(0, min(total - 1, int(index)))
+        self._qa_index = nxt
+        entry = self._qa_history[nxt]
+        self.overlay.set_answer_markdown_history(entry.answer)
+        self.overlay.set_answer_sources(entry.sources)
+        self.overlay.set_latest_quote(f"[{entry.timestamp}] {entry.question}")
+        self.overlay.set_answer_provenance(entry.provenance or f"Історія {nxt + 1}/{total}")
+        self.dashboard.set_live_answer_markdown(entry.answer, force_scroll_top=True)
+        self.dashboard.set_live_sources(entry.sources)
+        self._sync_qa_nav()
 
     def navigate_qa(self, delta: int) -> None:
         total = len(self._qa_history)
@@ -1993,14 +2196,7 @@ class CopilotController(QObject):
         nxt = max(0, min(total - 1, cur + delta))
         if nxt == cur:
             return
-        self._qa_index = nxt
-        entry = self._qa_history[nxt]
-        self.overlay.set_answer_markdown_history(entry.answer)
-        self.overlay.set_answer_sources(entry.sources)
-        self.overlay.set_answer_provenance(entry.provenance or f"Історія {nxt + 1}/{total}")
-        self.dashboard.set_live_answer_markdown(entry.answer, force_scroll_top=True)
-        self.dashboard.set_live_sources(entry.sources)
-        self._sync_qa_nav()
+        self.jump_to_qa(nxt)
 
     def clear_history(self) -> None:
         self._clear_pending_answer_flush()
@@ -2177,11 +2373,61 @@ class CopilotController(QObject):
         self.overlay.set_answer_provenance("⚡ Дорозпізнаю кінець фрази...")
         self._flush_wait_timer.start(1100)
 
+    def trigger_snip_answer(self) -> None:
+        """Open region-selection overlay and send the snipped screen area for analysis."""
+        if self._shutting_down or self._snip_overlay is not None:
+            return
+        was_overlay_visible = self.overlay.isVisible()
+        if was_overlay_visible:
+            self.overlay.hide()
+            QApplication.processEvents()
+
+        snip = ScreenSnipOverlay(max_width=max(1600, self.config.screen_capture_max_width))
+        self._snip_overlay = snip
+        snip.region_captured.connect(
+            lambda res, vis=was_overlay_visible: self._on_snip_captured(res, vis)
+        )
+        snip.cancelled.connect(
+            lambda vis=was_overlay_visible: self._on_snip_cancelled(vis)
+        )
+        snip.show()
+        snip.raise_()
+        snip.activateWindow()
+
+    def _on_snip_cancelled(self, restore_overlay: bool) -> None:
+        if self._snip_overlay is not None:
+            self._snip_overlay.deleteLater()
+            self._snip_overlay = None
+        if restore_overlay and not self._shutting_down:
+            self.overlay.showNormal()
+            self.overlay.raise_()
+            self.overlay.set_stealth_mode(self.overlay.stealth_enabled)
+
+    def _on_snip_captured(self, shot: ScreenCaptureResult, _restore_overlay: bool) -> None:
+        if self._snip_overlay is not None:
+            self._snip_overlay.deleteLater()
+            self._snip_overlay = None
+        if self._shutting_down:
+            return
+        self.overlay.showNormal()
+        self.overlay.raise_()
+        self.overlay.set_stealth_mode(self.overlay.stealth_enabled)
+        manual = self.overlay.manual_input.text().strip()
+        selected = self.overlay.get_selected_transcript()
+        self.overlay.manual_input.clear()
+        self._execute_answer(
+            manual,
+            selected,
+            detail_mode="concise",
+            override_screen_shot=shot,
+        )
+
     def _execute_answer(
         self,
         manual_question: str,
         selected_transcript: str,
         detail_mode: str = "concise",
+        override_screen_shot: ScreenCaptureResult | None = None,
     ) -> None:
         if self._shutting_down:
             return
@@ -2189,10 +2435,15 @@ class CopilotController(QObject):
         transcript_excerpt = self._collect_recent_transcript(selected_transcript)
         manual_clean = manual_question.strip()
 
-        if not transcript_excerpt and not manual_clean and not self.config.screen_vision_enabled:
+        if (
+            not transcript_excerpt
+            and not manual_clean
+            and not self.config.screen_vision_enabled
+            and override_screen_shot is None
+        ):
             hint = (
                 "Немає мовлення чи запитання. Натисніть «Старт» для прослуховування, "
-                "введіть питання вручну або увімкніть «👁 Екран»."
+                "введіть питання вручну, виділіть область «✂» або увімкніть «👁 Екран»."
             )
             self.overlay.show_answer_error(hint)
             self.overlay.set_answer_provenance("Немає вхідного тексту")
@@ -2218,7 +2469,11 @@ class CopilotController(QObject):
 
         screen_bytes: bytes | None = None
         screen_mime = "image/jpeg"
-        if self.config.screen_vision_enabled:
+        is_snip = override_screen_shot is not None
+        if override_screen_shot is not None and override_screen_shot.image_bytes:
+            screen_bytes = override_screen_shot.image_bytes
+            screen_mime = override_screen_shot.mime_type
+        elif self.config.screen_vision_enabled:
             shot = capture_screen(
                 screen_index=self.config.screen_capture_index,
                 max_width=self.config.screen_capture_max_width,
@@ -2228,8 +2483,10 @@ class CopilotController(QObject):
                 screen_mime = shot.mime_type
 
         doc_sources = list(sources)
-        if screen_bytes is not None and "👁 Екран" not in doc_sources:
-            doc_sources.append("👁 Екран")
+        if screen_bytes is not None:
+            screen_badge = "✂ Область" if is_snip else "👁 Екран"
+            if screen_badge not in doc_sources:
+                doc_sources.append(screen_badge)
         self._current_doc_sources = doc_sources
         self._current_all_sources = list(doc_sources)
         self.dashboard.set_live_sources(doc_sources)
@@ -2273,7 +2530,7 @@ class CopilotController(QObject):
         self.overlay.begin_answer_stream()
         mode_tag = "детально" if detail_mode == "detailed" else "тезисно"
         web_tag = " · 🌐 Веб" if self.config.web_search_enabled else ""
-        screen_tag = " · 👁 Екран" if screen_bytes is not None else ""
+        screen_tag = (" · ✂ Область" if is_snip else " · 👁 Екран") if screen_bytes is not None else ""
         self.overlay.set_answer_provenance(
             f"Генерація ({mode_tag}, {self.llm_client.provider_display_name()}{web_tag}{screen_tag})..."
         )
@@ -2483,6 +2740,7 @@ class CopilotController(QObject):
                 new_config.hotkey_screen,
                 new_config.hotkey_web,
                 new_config.hotkey_capture,
+                new_config.hotkey_snip,
             )
         except ValueError as exc:
             self.dashboard.show_settings_error(f"Помилка гарячої клавіші: {exc}")
@@ -2547,6 +2805,7 @@ class CopilotController(QObject):
             format_hotkey_label(new_config.hotkey_screen),
             format_hotkey_label(new_config.hotkey_web),
             format_hotkey_label(new_config.hotkey_capture),
+            format_hotkey_label(new_config.hotkey_snip),
         )
         self.overlay.set_answer_provenance(self.llm_client.provider_display_name())
 
@@ -2616,6 +2875,13 @@ class CopilotController(QObject):
         self._live_render_timer.stop()
         self._opacity_save_timer.stop()
         self._hotkey_bridge.stop()
+        if self._snip_overlay is not None:
+            try:
+                self._snip_overlay.close()
+                self._snip_overlay.deleteLater()
+            except Exception:
+                pass
+            self._snip_overlay = None
 
         if self._tray_icon is not None:
             self._tray_icon.hide()
@@ -2831,20 +3097,59 @@ def _signal_existing_instance(server_name: str) -> bool:
 
 
 def _install_crash_hook() -> None:
-    prev_hook = sys.excepthook
+    _early_install_crash_hook()
 
-    def _on_unhandled_exception(exc_type, exc_value, exc_tb) -> None:
-        logger.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
-        log_hint = f"\n\nЛог: {_LOG_FILE_PATH}" if _LOG_FILE_PATH else ""
-        _show_startup_message(
-            "AI Copilot — Помилка",
-            f"Виникла непередбачена помилка:\n{exc_value}{log_hint}",
-            is_error=True,
+
+class _StartupSplash(QWidget):
+    """Instant lightweight splash screen shown while UI and background services initialize."""
+
+    def __init__(self, app_icon: QIcon | None = None) -> None:
+        super().__init__(None)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.SplashScreen
         )
-        if prev_hook is not None:
-            prev_hook(exc_type, exc_value, exc_tb)
+        self.setFixedSize(300, 108)
+        self.setStyleSheet(
+            "background-color:#11151E; border:1px solid #2C3548; border-radius:10px; "
+            "color:#F8FAFC; font-family:'Segoe UI', sans-serif;"
+        )
+        if app_icon is not None and not app_icon.isNull():
+            self.setWindowIcon(app_icon)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(6)
+        title = QLabel("AI Copilot", self)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title.setStyleSheet("font-size:16px; font-weight:700; border:none;")
+        sub = QLabel("Завантаження інтерфейсу…", self)
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setStyleSheet("font-size:12px; color:#93A4BE; border:none;")
+        lay.addWidget(title)
+        lay.addWidget(sub)
 
-    sys.excepthook = _on_unhandled_exception
+        scr = QGuiApplication.primaryScreen()
+        if scr is not None:
+            avail = scr.availableGeometry()
+            self.move(
+                avail.left() + max(0, (avail.width() - self.width()) // 2),
+                avail.top() + max(0, (avail.height() - self.height()) // 2),
+            )
+
+    def showEvent(self, event) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        hwnd = int(self.winId()) if self.winId() else 0
+        apply_window_display_affinity(hwnd, True)
+
+
+def _clear_startup_sentinel() -> None:
+    try:
+        sentinel = _startup_sentinel_path()
+        if sentinel.is_file():
+            sentinel.unlink()
+    except OSError:
+        pass
 
 
 def main() -> int:
@@ -2852,16 +3157,28 @@ def main() -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--lite", action="store_true")
+    parser.add_argument("--software", action="store_true")
+    parser.add_argument("--diagnose", action="store_true")
+    parser.add_argument("--diagnose-out", default="")
     parser.add_argument("--smoke-test-out", default="")
     args, qt_args = parser.parse_known_args()
+
+    if args.diagnose:
+        run_diagnostics(
+            write_report=True,
+            show_dialog=(not args.smoke_test),
+            out_path=args.diagnose_out or None,
+        )
+        return 0
 
     if args.smoke_test:
         return _run_smoke_test(args.smoke_test_out or None, lite=args.lite)
 
     _install_crash_hook()
     logger.info(
-        "[startup] frozen=%s exe=%s data_dir=%s",
+        "[startup] frozen=%s software_gl=%s exe=%s data_dir=%s",
         bool(getattr(sys, "frozen", False)),
+        _SOFTWARE_RENDERING_ACTIVE,
         sys.executable,
         _get_runtime_data_dir(),
     )
@@ -2888,8 +3205,23 @@ def main() -> int:
             )
         return 0
 
+    sentinel = _startup_sentinel_path()
+    try:
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+
+    splash: _StartupSplash | None = None
     try:
         app = QApplication([sys.argv[0], *qt_args])
+        app_icon = _load_app_icon()
+        if not app_icon.isNull():
+            app.setWindowIcon(app_icon)
+
+        splash = _StartupSplash(app_icon=app_icon)
+        splash.show()
+        app.processEvents()
 
         local_server = QLocalServer(app)
         QLocalServer.removeServer(SINGLE_INSTANCE_SERVER_NAME)
@@ -2903,10 +3235,6 @@ def main() -> int:
             config.dashboard_stealth = True
             save_config_to_env(config)
 
-        app_icon = _load_app_icon()
-        if not app_icon.isNull():
-            app.setWindowIcon(app_icon)
-
         dashboard = DashboardWindow(config=config, app_icon=app_icon)
         overlay = CopilotOverlayWindow(
             hotkey_answer_label=format_hotkey_label(config.hotkey_answer),
@@ -2914,6 +3242,7 @@ def main() -> int:
             hotkey_screen_label=format_hotkey_label(config.hotkey_screen),
             hotkey_web_label=format_hotkey_label(config.hotkey_web),
             hotkey_capture_label=format_hotkey_label(config.hotkey_capture),
+            hotkey_snip_label=format_hotkey_label(config.hotkey_snip),
             stealth_enabled=config.overlay_stealth,
             opacity_percent=config.overlay_opacity,
             font_scale=config.overlay_font_scale,
@@ -2942,21 +3271,36 @@ def main() -> int:
         app.aboutToQuit.connect(local_server.close)
         app.aboutToQuit.connect(controller.shutdown)
         app.aboutToQuit.connect(instance_guard.release)
+        app.aboutToQuit.connect(_clear_startup_sentinel)
 
         dashboard.show()
+        splash.close()
+        splash.deleteLater()
+        splash = None
+        _clear_startup_sentinel()
+
         controller.start()
         logger.info("[startup] Dashboard shown and background workers started")
         try:
             return app.exec()
         finally:
+            _clear_startup_sentinel()
             instance_guard.release()
     except Exception as exc:
+        if splash is not None:
+            try:
+                splash.close()
+                splash.deleteLater()
+            except Exception:
+                pass
         logger.exception("Fatal startup error")
         instance_guard.release()
         log_hint = f"\n\nДеталі у файлі:\n{_LOG_FILE_PATH}" if _LOG_FILE_PATH else ""
         _show_startup_message(
             "AI Copilot — Помилка запуску",
-            f"Не вдалося запустити програму:\n{exc}{log_hint}",
+            f"Не вдалося запустити програму:\n{exc}\n\n"
+            "Спробуйте запустити «AI Copilot — Режим сумісності» (--software) "
+            f"або «Діагностика» (--diagnose).{log_hint}",
             is_error=True,
         )
         return 1

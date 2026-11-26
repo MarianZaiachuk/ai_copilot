@@ -6,7 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Iterable
 
-from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QIcon, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -67,6 +68,12 @@ PROVIDER_CHOICES: list[tuple[str, str]] = [
     ("gemini", "Google Gemini (Gemini 3.8 Flash / Gemini 4)"),
     ("ollama", "Ollama (локально на ПК, без ключа)"),
     ("lmstudio", "LM Studio (локально на ПК, без ключа)"),
+]
+
+FALLBACK_PROVIDER_CHOICES: list[tuple[str, str]] = [
+    ("auto", "Авто (будь-який інший налаштований провайдер)"),
+    ("none", "Вимкнено (без перемикання провайдерів)"),
+    *PROVIDER_CHOICES,
 ]
 
 MODEL_PRESETS: dict[str, list[str]] = {
@@ -445,6 +452,8 @@ class DashboardWindow(QWidget):
     cancel_answer_requested = pyqtSignal()
     deep_answer_requested = pyqtSignal()
     qa_nav_requested = pyqtSignal(int)
+    qa_jump_requested = pyqtSignal(int)
+    snip_requested = pyqtSignal()
     device_selected = pyqtSignal(int)
     web_search_toggled = pyqtSignal(bool)
     screen_vision_toggled = pyqtSignal(bool)
@@ -459,6 +468,9 @@ class DashboardWindow(QWidget):
     profile_rename_requested = pyqtSignal(str, str)
     profile_delete_requested = pyqtSignal(str)
     profile_language_changed = pyqtSignal(str, str)
+    profile_export_requested = pyqtSignal(str, bool)
+    profile_import_requested = pyqtSignal(str)
+    run_diagnostics_requested = pyqtSignal()
     quit_requested = pyqtSignal()
     minimized_to_tray = pyqtSignal()
 
@@ -485,6 +497,8 @@ class DashboardWindow(QWidget):
         self._settings_save_rejected = False
         self._last_answer_markdown = ""
         self._qa_history_entries: list[tuple[str, str, str, list[str]]] = []
+        self._qa_history_nav_items: list[tuple[str, str]] = []
+        self._qa_history_active_idx = -1
 
         self._copy_reset_timer = QTimer(self)
         self._copy_reset_timer.setSingleShot(True)
@@ -548,6 +562,7 @@ class DashboardWindow(QWidget):
                 candidate.hotkey_screen,
                 candidate.hotkey_web,
                 candidate.hotkey_capture,
+                candidate.hotkey_snip,
             )
             is not None
         ):
@@ -857,8 +872,8 @@ class DashboardWindow(QWidget):
 
         priv_card = self._make_card(page)
         priv_l = QVBoxLayout(priv_card)
-        priv_l.setContentsMargins(16, 12, 16, 12)
-        priv_l.setSpacing(6)
+        priv_l.setContentsMargins(14, 9, 14, 9)
+        priv_l.setSpacing(4)
         p_title = QLabel("Як це працює і приватність", priv_card)
         p_title.setObjectName("CardTitle")
         priv_l.addWidget(p_title)
@@ -877,8 +892,8 @@ class DashboardWindow(QWidget):
 
         hk_card = self._make_card(page)
         hk_l = QVBoxLayout(hk_card)
-        hk_l.setContentsMargins(14, 8, 14, 8)
-        hk_l.setSpacing(3)
+        hk_l.setContentsMargins(14, 6, 14, 6)
+        hk_l.setSpacing(2)
         hk_title = QLabel("Гарячі клавіші", hk_card)
         hk_title.setObjectName("CardTitle")
         hk_l.addWidget(hk_title)
@@ -888,6 +903,7 @@ class DashboardWindow(QWidget):
         self._hk_capture_pill = self._add_hotkey_row(hk_l, "Старт / стоп сесії")
         self._hk_screen_pill = self._add_hotkey_row(hk_l, "Зір екрана (👁)")
         self._hk_web_pill = self._add_hotkey_row(hk_l, "Веб-пошук (🌐)")
+        self._hk_snip_pill = self._add_hotkey_row(hk_l, "Область екрана (✂)")
 
         hk_tip = QLabel(
             "Гарячі клавіші працюють глобально незалежно від української чи англійської розкладки.",
@@ -953,17 +969,19 @@ class DashboardWindow(QWidget):
         layout.addLayout(hdr_row)
 
         top_bar = QHBoxLayout()
-        top_bar.setSpacing(6)
+        top_bar.setSpacing(5)
 
         self._live_start_btn = QPushButton("▶ Почати сесію", page)
         self._live_start_btn.setObjectName("PrimaryCTA")
         self._live_start_btn.setProperty("capturing", "false")
+        self._live_start_btn.setStyleSheet("padding: 7px 12px;")
         self._live_start_btn.clicked.connect(self._on_toggle_capture_clicked)
         top_bar.addWidget(self._live_start_btn)
 
         self._live_web_btn = QPushButton("🌐 Веб", page)
         self._live_web_btn.setObjectName("LiveWebBtn")
         self._live_web_btn.setCheckable(True)
+        self._live_web_btn.setStyleSheet("padding: 6px 10px;")
         self._live_web_btn.setToolTip(
             "Увімкнути / вимкнути пошук в інтернеті та веб-агента під час відповідей"
         )
@@ -973,20 +991,31 @@ class DashboardWindow(QWidget):
         self._live_screen_btn = QPushButton("👁 Екран", page)
         self._live_screen_btn.setObjectName("LiveScreenBtn")
         self._live_screen_btn.setCheckable(True)
+        self._live_screen_btn.setStyleSheet("padding: 6px 10px;")
         self._live_screen_btn.setToolTip(
             "Зір екрана: прикріплювати знімок екрана (код в IDE / слайди)"
         )
         self._live_screen_btn.toggled.connect(self._on_live_screen_toggled)
         top_bar.addWidget(self._live_screen_btn)
 
+        self._live_snip_btn = QPushButton("✂ Обл.", page)
+        self._live_snip_btn.setStyleSheet("padding: 6px 10px;")
+        self._live_snip_btn.setToolTip(
+            "Виділити область екрана (Ctrl+Alt+A) — графік, формула або фрагмент коду"
+        )
+        self._live_snip_btn.clicked.connect(self.snip_requested.emit)
+        top_bar.addWidget(self._live_snip_btn)
+
         top_bar.addStretch(1)
 
         live_export_btn = QPushButton("Експорт (.md)", page)
+        live_export_btn.setStyleSheet("padding: 6px 10px;")
         live_export_btn.setToolTip("Зберегти транскрипт та всю сесію ШІ у файл")
         live_export_btn.clicked.connect(self._export_session_markdown)
         top_bar.addWidget(live_export_btn)
 
         live_clear_btn = QPushButton("Очистити", page)
+        live_clear_btn.setStyleSheet("padding: 6px 10px;")
         live_clear_btn.clicked.connect(self.clear_all_requested.emit)
         top_bar.addWidget(live_clear_btn)
         layout.addLayout(top_bar)
@@ -1019,8 +1048,10 @@ class DashboardWindow(QWidget):
         self._live_qa_prev_btn.setToolTip("Попередня відповідь (Alt+Left)")
         self._live_qa_prev_btn.clicked.connect(lambda: self.qa_nav_requested.emit(-1))
         qa_l.addWidget(self._live_qa_prev_btn)
-        self._live_qa_counter_lbl = QLabel("0/0", self._live_qa_nav)
-        self._live_qa_counter_lbl.setObjectName("MutedText")
+        self._live_qa_counter_lbl = QPushButton("0/0", self._live_qa_nav)
+        self._live_qa_counter_lbl.setObjectName("NavIconBtn")
+        self._live_qa_counter_lbl.setToolTip("Швидкий перехід між картками відповідей")
+        self._live_qa_counter_lbl.clicked.connect(self._on_live_qa_counter_clicked)
         qa_l.addWidget(self._live_qa_counter_lbl)
         self._live_qa_next_btn = QPushButton("›", self._live_qa_nav)
         self._live_qa_next_btn.setObjectName("NavIconBtn")
@@ -1134,6 +1165,17 @@ class DashboardWindow(QWidget):
             self.profile_lang_combo.addItem(label, code)
         self.profile_lang_combo.currentIndexChanged.connect(self._on_profile_lang_changed)
         prof_lang_row.addWidget(self.profile_lang_combo, 1)
+
+        self._export_profile_btn = QPushButton("⬆ Експорт", prof_card)
+        self._export_profile_btn.setToolTip("Експортувати профіль(і) у JSON без секретів і шляхів")
+        self._export_profile_btn.clicked.connect(self._on_export_profile_clicked)
+        prof_lang_row.addWidget(self._export_profile_btn)
+
+        self._import_profile_btn = QPushButton("⬇ Імпорт", prof_card)
+        self._import_profile_btn.setToolTip("Імпортувати профіль(і) з JSON-файлу")
+        self._import_profile_btn.clicked.connect(self._on_import_profile_clicked)
+        prof_lang_row.addWidget(self._import_profile_btn)
+
         prof_l.addLayout(prof_lang_row)
         layout.addWidget(prof_card)
 
@@ -1248,6 +1290,11 @@ class DashboardWindow(QWidget):
         self._save_status_lbl.setObjectName("MutedText")
         footer.addWidget(self._save_status_lbl, 1)
 
+        self._diag_btn = QPushButton("🩺 Діагностика", page)
+        self._diag_btn.setToolTip("Перевірити сумісність Windows, VC++, AVX2 та аудіопристроїв")
+        self._diag_btn.clicked.connect(self.run_diagnostics_requested.emit)
+        footer.addWidget(self._diag_btn)
+
         save_btn = QPushButton("Зберегти та застосувати", page)
         save_btn.setObjectName("PrimaryCTA")
         save_btn.clicked.connect(self._on_save_settings_clicked)
@@ -1316,6 +1363,14 @@ class DashboardWindow(QWidget):
         self._base_url_edit = QLineEdit(tab)
         self._base_url_edit.textChanged.connect(self._on_credentials_edited)
         form.addRow("Base URL (опційно):", self._base_url_edit)
+
+        self._fallback_provider_combo = QComboBox(tab)
+        for code, label in FALLBACK_PROVIDER_CHOICES:
+            self._fallback_provider_combo.addItem(label, code)
+        self._fallback_provider_combo.setToolTip(
+            "Резервний провайдер, якщо основний повернув 429, таймаут або помилку сервера"
+        )
+        form.addRow("Авто-фолбек провайдер:", self._fallback_provider_combo)
 
         params_row = QHBoxLayout()
         self._temp_spin = QDoubleSpinBox(tab)
@@ -1526,6 +1581,10 @@ class DashboardWindow(QWidget):
         self._hk_web_edit = QLineEdit(tab)
         self._hk_web_edit.setPlaceholderText("ctrl+alt+w")
         form.addRow("Веб-пошук (🌐):", self._hk_web_edit)
+
+        self._hk_snip_edit = QLineEdit(tab)
+        self._hk_snip_edit.setPlaceholderText("ctrl+alt+a")
+        form.addRow("Область екрана (✂):", self._hk_snip_edit)
 
         scroll.setWidget(tab)
         return scroll
@@ -1762,6 +1821,7 @@ class DashboardWindow(QWidget):
         self._model_combo.blockSignals(False)
         self._update_model_warning(current_model)
         self._base_url_edit.setText("" if cfg.llm_provider == "gemini" else cfg.openai_base_url)
+        self._select_combo_by_data(self._fallback_provider_combo, cfg.llm_fallback_provider)
         self._temp_spin.setValue(cfg.llm_temperature)
         self._max_tokens_spin.setValue(cfg.llm_max_tokens)
 
@@ -1796,6 +1856,7 @@ class DashboardWindow(QWidget):
         self._hk_capture_edit.setText(cfg.hotkey_capture)
         self._hk_screen_edit.setText(cfg.hotkey_screen)
         self._hk_web_edit.setText(cfg.hotkey_web)
+        self._hk_snip_edit.setText(cfg.hotkey_snip)
         self.vocab_edit.setText(cfg.custom_vocabulary)
         self.prompt_edit.setPlainText(cfg.system_prompt)
 
@@ -1821,6 +1882,7 @@ class DashboardWindow(QWidget):
         self._hk_capture_pill.setText(self._fmt_hotkey(cfg.hotkey_capture))
         self._hk_screen_pill.setText(self._fmt_hotkey(cfg.hotkey_screen))
         self._hk_web_pill.setText(self._fmt_hotkey(cfg.hotkey_web))
+        self._hk_snip_pill.setText(self._fmt_hotkey(cfg.hotkey_snip))
         self._refresh_live_toggle_tooltips(cfg)
 
     @staticmethod
@@ -1960,6 +2022,7 @@ class DashboardWindow(QWidget):
             cerebras_model=cerebras_model,
             gemini_api_key=gemini_key,
             gemini_model=gemini_model,
+            llm_fallback_provider=str(self._fallback_provider_combo.currentData() or "auto"),
             llm_temperature=float(self._temp_spin.value()),
             llm_max_tokens=int(self._max_tokens_spin.value()),
             whisper_model=str(self._whisper_model_combo.currentData() or "large-v3-turbo"),
@@ -1988,6 +2051,7 @@ class DashboardWindow(QWidget):
             hotkey_capture=self._hk_capture_edit.text().strip().lower() or "ctrl+alt+r",
             hotkey_screen=self._hk_screen_edit.text().strip().lower() or "ctrl+alt+s",
             hotkey_web=self._hk_web_edit.text().strip().lower() or "ctrl+alt+w",
+            hotkey_snip=self._hk_snip_edit.text().strip().lower() or "ctrl+alt+a",
             custom_vocabulary=self.vocab_edit.text().strip(),
             system_prompt=prompt_text,
             web_search_enabled=self._web_enabled_chk.isChecked(),
@@ -2228,6 +2292,9 @@ class DashboardWindow(QWidget):
         self._live_screen_btn.setToolTip(
             f"Зір екрана: прикріплювати знімок екрана ({self._fmt_hotkey(ref.hotkey_screen)})"
         )
+        self._live_snip_btn.setToolTip(
+            f"Виділити область екрана ({self._fmt_hotkey(ref.hotkey_snip)}) — графік, формула або фрагмент коду"
+        )
 
     @staticmethod
     def _validate_hotkey_pair(
@@ -2236,6 +2303,7 @@ class DashboardWindow(QWidget):
         hk_screen: str | None = None,
         hk_web: str | None = None,
         hk_capture: str | None = None,
+        hk_snip: str | None = None,
     ) -> str | None:
         modifiers = {"ctrl", "control", "alt", "shift", "win", "cmd", "super"}
         specs: list[tuple[str, str]] = [
@@ -2248,6 +2316,8 @@ class DashboardWindow(QWidget):
             specs.append(("Зір екрана", hk_screen))
         if hk_web is not None:
             specs.append(("Веб-пошук", hk_web))
+        if hk_snip is not None:
+            specs.append(("Область екрана", hk_snip))
 
         seen: dict[str, str] = {}
         for label, raw in specs:
@@ -2272,6 +2342,7 @@ class DashboardWindow(QWidget):
             new_cfg.hotkey_screen,
             new_cfg.hotkey_web,
             new_cfg.hotkey_capture,
+            new_cfg.hotkey_snip,
         )
         if hotkey_err:
             self.show_settings_error(hotkey_err)
@@ -2292,6 +2363,7 @@ class DashboardWindow(QWidget):
         self._hk_capture_pill.setText(self._fmt_hotkey(new_cfg.hotkey_capture))
         self._hk_screen_pill.setText(self._fmt_hotkey(new_cfg.hotkey_screen))
         self._hk_web_pill.setText(self._fmt_hotkey(new_cfg.hotkey_web))
+        self._hk_snip_pill.setText(self._fmt_hotkey(new_cfg.hotkey_snip))
         self._refresh_live_toggle_tooltips(new_cfg)
         self._save_status_lbl.setStyleSheet("color: #4ADE80;")
         self._save_status_lbl.setText("Налаштування збережено та застосовано.")
@@ -2386,6 +2458,45 @@ class DashboardWindow(QWidget):
         )
         if reply == QMessageBox.StandardButton.Yes:
             self.profile_delete_requested.emit(pid)
+
+    def _on_export_profile_clicked(self) -> None:
+        export_all = False
+        if self.profile_combo.count() > 1:
+            box = QMessageBox(self)
+            box.setWindowTitle("Експорт профілів")
+            box.setText("Експортувати лише поточний профіль чи всі профілі?\n(API-ключі та локальні шляхи файлів не включаються.)")
+            box.addButton("Лише поточний", QMessageBox.ButtonRole.AcceptRole)
+            btn_all = box.addButton("Усі профілі", QMessageBox.ButtonRole.ActionRole)
+            btn_cancel = box.addButton("Скасувати", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked == btn_cancel or clicked is None:
+                return
+            export_all = clicked == btn_all
+
+        default_name = (
+            "ai_copilot_profiles.json"
+            if export_all
+            else f"profile_{self.profile_combo.currentText().strip() or 'subject'}.json"
+        )
+        path_str, _ = QFileDialog.getSaveFileName(
+            self,
+            "Експортувати профіль(і)",
+            default_name,
+            "JSON профілі (*.json)",
+        )
+        if path_str:
+            self.profile_export_requested.emit(path_str, export_all)
+
+    def _on_import_profile_clicked(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Імпортувати профіль(і)",
+            "",
+            "JSON профілі (*.json)",
+        )
+        if path_str:
+            self.profile_import_requested.emit(path_str)
 
     def sync_profile_state(
         self, cfg: AppConfig, profiles: list[PromptProfile], active_id: str
@@ -2734,10 +2845,30 @@ class DashboardWindow(QWidget):
     def set_qa_history_position(self, current: int, total: int) -> None:
         total = max(0, int(total))
         current = max(0, min(int(current), total))
-        self._live_qa_counter_lbl.setText(f"{current}/{total}")
+        self._live_qa_counter_lbl.setText(f"{current}/{total} ▾" if total > 1 else f"{current}/{total}")
+        self._live_qa_counter_lbl.setEnabled(total > 1)
         self._live_qa_prev_btn.setEnabled(current > 1)
         self._live_qa_next_btn.setEnabled(0 < current < total)
         self._live_qa_nav.setVisible(total > 1)
+
+    def set_qa_history_items(self, items: list[tuple[str, str]], active_index: int) -> None:
+        """Store (timestamp, question) tuples for quick-jump card selection."""
+        self._qa_history_nav_items = list(items)
+        self._qa_history_active_idx = int(active_index)
+
+    def _on_live_qa_counter_clicked(self) -> None:
+        if len(self._qa_history_nav_items) <= 1:
+            return
+        menu = QMenu(self)
+        for idx, (ts, question) in enumerate(self._qa_history_nav_items):
+            preview = " ".join((question or "").split())
+            if len(preview) > 54:
+                preview = preview[:51] + "…"
+            act = menu.addAction(f"#{idx + 1} [{ts}] {preview or 'Відповідь'}")
+            act.setCheckable(True)
+            act.setChecked(idx == self._qa_history_active_idx)
+            act.triggered.connect(lambda _chk=False, target=idx: self.qa_jump_requested.emit(target))
+        menu.exec(self._live_qa_counter_lbl.mapToGlobal(QPoint(0, self._live_qa_counter_lbl.height())))
 
     def set_qa_history_entries(self, entries: list[tuple[str, str, str, list[str]]]) -> None:
         """Store formatted (timestamp, question, answer, sources) tuples for Markdown export."""

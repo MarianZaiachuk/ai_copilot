@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QProgressBar,
     QPushButton,
     QSizeGrip,
@@ -40,6 +41,7 @@ from PyQt6.QtWidgets import (
 
 from audio_capture import AudioDeviceInfo
 from context_loader import build_file_dialog_filter
+from latex_renderer import extract_latex_placeholders, has_latex_math, inject_latex_html
 
 WDA_NONE = 0x00000000
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
@@ -188,11 +190,23 @@ def set_browser_markdown_sticky(
     *,
     force_scroll_top: bool = False,
 ) -> None:
-    """Render Markdown while preserving scroll position unless already pinned at bottom."""
+    """Render Markdown (with styled LaTeX math) while preserving scroll position."""
     sb = browser.verticalScrollBar()
     was_at_bottom = sb is None or sb.maximum() <= 0 or sb.value() >= sb.maximum() - 24
     prev_val = sb.value() if sb is not None else 0
-    browser.setMarkdown(balance_markdown_fences(markdown_text))
+
+    balanced = balance_markdown_fences(markdown_text)
+    if has_latex_math(balanced):
+        masked, placeholders = extract_latex_placeholders(balanced)
+        if placeholders:
+            browser.setMarkdown(masked)
+            rendered = browser.toHtml()
+            browser.setHtml(inject_latex_html(rendered, placeholders))
+        else:
+            browser.setMarkdown(balanced)
+    else:
+        browser.setMarkdown(balanced)
+
     if sb is None:
         return
     if force_scroll_top:
@@ -594,6 +608,8 @@ class CopilotOverlayWindow(QWidget):
     cancel_answer_requested = pyqtSignal()
     deep_answer_requested = pyqtSignal()
     qa_nav_requested = pyqtSignal(int)
+    qa_jump_requested = pyqtSignal(int)
+    snip_requested = pyqtSignal()
     device_selected = pyqtSignal(int)
     stealth_toggled = pyqtSignal(bool)
     opacity_changed = pyqtSignal(int)
@@ -620,6 +636,7 @@ class CopilotOverlayWindow(QWidget):
         hotkey_screen_label: str = "Ctrl+Alt+S",
         hotkey_web_label: str = "Ctrl+Alt+W",
         hotkey_capture_label: str = "Ctrl+Alt+R",
+        hotkey_snip_label: str = "Ctrl+Alt+A",
     ) -> None:
         super().__init__(parent)
         self._hotkey_answer_label = hotkey_answer_label
@@ -627,6 +644,9 @@ class CopilotOverlayWindow(QWidget):
         self._hotkey_screen_label = hotkey_screen_label
         self._hotkey_web_label = hotkey_web_label
         self._hotkey_capture_label = hotkey_capture_label
+        self._hotkey_snip_label = hotkey_snip_label
+        self._qa_history_items: list[tuple[str, str]] = []
+        self._qa_history_active_idx = -1
 
         self._stealth_enabled = bool(stealth_enabled)
         self._stealth_applied = False
@@ -972,6 +992,15 @@ class CopilotOverlayWindow(QWidget):
         self.manual_input.returnPressed.connect(self._emit_answer_request)
         prompt_row.addWidget(self.manual_input, 1)
 
+        self._snip_btn = QPushButton("✂", self._prompt_row_widget)
+        self._snip_btn.setObjectName("IconButton")
+        self._snip_btn.setFixedWidth(30)
+        self._snip_btn.setToolTip(
+            f"Виділити область екрана ({self._hotkey_snip_label}) — графік, формула або код"
+        )
+        self._snip_btn.clicked.connect(self.snip_requested.emit)
+        prompt_row.addWidget(self._snip_btn)
+
         self.answer_btn = QPushButton(
             f"Відповісти ({self._hotkey_answer_label})", self._prompt_row_widget
         )
@@ -1018,10 +1047,11 @@ class CopilotOverlayWindow(QWidget):
         self._qa_prev_btn.clicked.connect(lambda: self.qa_nav_requested.emit(-1))
         qa_nav_l.addWidget(self._qa_prev_btn)
 
-        self._qa_counter_lbl = QLabel("0/0", self._qa_nav_widget)
-        self._qa_counter_lbl.setObjectName("StatusLabel")
-        self._qa_counter_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._qa_counter_lbl.setMinimumWidth(26)
+        self._qa_counter_lbl = QPushButton("0/0", self._qa_nav_widget)
+        self._qa_counter_lbl.setObjectName("NavIconBtn")
+        self._qa_counter_lbl.setMinimumWidth(34)
+        self._qa_counter_lbl.setToolTip("Швидкий перехід до будь-якої відповіді сесії")
+        self._qa_counter_lbl.clicked.connect(self._on_qa_counter_clicked)
         qa_nav_l.addWidget(self._qa_counter_lbl)
 
         self._qa_next_btn = QPushButton("›", self._qa_nav_widget)
@@ -1121,6 +1151,7 @@ class CopilotOverlayWindow(QWidget):
         screen_label: str | None = None,
         web_label: str | None = None,
         capture_label: str | None = None,
+        snip_label: str | None = None,
     ) -> None:
         self._hotkey_answer_label = answer_label
         self._hotkey_toggle_label = toggle_label
@@ -1130,7 +1161,12 @@ class CopilotOverlayWindow(QWidget):
             self._hotkey_web_label = web_label
         if capture_label is not None:
             self._hotkey_capture_label = capture_label
+        if snip_label is not None:
+            self._hotkey_snip_label = snip_label
         self._hide_btn.setToolTip(f"Сховати оверлей ({toggle_label})")
+        self._snip_btn.setToolTip(
+            f"Виділити область екрана ({self._hotkey_snip_label}) — графік, формула або код"
+        )
         self._capture_btn.setToolTip(
             f"Запуск / зупинка прослуховування звуку ({self._hotkey_capture_label})"
         )
@@ -1506,10 +1542,31 @@ class CopilotOverlayWindow(QWidget):
         """Update Q&A history pagination controls ('‹ n/m ›')."""
         total = max(0, int(total))
         current = max(0, min(int(current), total))
-        self._qa_counter_lbl.setText(f"{current}/{total}")
+        self._qa_counter_lbl.setText(f"{current}/{total} ▾" if total > 1 else f"{current}/{total}")
+        self._qa_counter_lbl.setEnabled(total > 1)
         self._qa_prev_btn.setEnabled(current > 1)
         self._qa_next_btn.setEnabled(0 < current < total)
         self._qa_nav_widget.setVisible(total > 1)
+
+    def set_qa_history_items(self, items: list[tuple[str, str]], active_index: int) -> None:
+        """Store (timestamp, question) tuples for quick-jump card menu."""
+        self._qa_history_items = list(items)
+        self._qa_history_active_idx = int(active_index)
+
+    def _on_qa_counter_clicked(self) -> None:
+        if len(self._qa_history_items) <= 1:
+            return
+        menu = QMenu(self)
+        for idx, (ts, question) in enumerate(self._qa_history_items):
+            preview = " ".join((question or "").split())
+            if len(preview) > 48:
+                preview = preview[:45] + "…"
+            label = f"#{idx + 1} [{ts}] {preview or 'Відповідь'}"
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(idx == self._qa_history_active_idx)
+            act.triggered.connect(lambda _chk=False, target=idx: self.qa_jump_requested.emit(target))
+        menu.exec(self._qa_counter_lbl.mapToGlobal(QPoint(0, self._qa_counter_lbl.height())))
 
     def set_latest_quote(self, text: str) -> None:
         cleaned = text.strip()

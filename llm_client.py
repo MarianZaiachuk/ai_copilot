@@ -20,7 +20,13 @@ from google import genai
 from google.genai import types as genai_types
 from openai import OpenAI
 
-from config import AppConfig, VALID_LLM_PROVIDERS, get_provider_api_key, get_provider_model
+from config import (
+    AppConfig,
+    VALID_LLM_PROVIDERS,
+    get_provider_api_key,
+    get_provider_model,
+    has_valid_llm_credentials,
+)
 from security import redact_secrets, register_secret
 from web_search import (
     WebPageContent,
@@ -159,6 +165,7 @@ DEPRECATED_MODEL_REPLACEMENTS: dict[str, str] = {
 
 _GROQ_VISION_MODEL = "qwen/qwen3.8-27b"
 _CEREBRAS_VISION_MODEL = "qwen-3.8-27b"
+_AUTO_FAILOVER_ORDER: tuple[str, ...] = ("groq", "cerebras", "gemini", "openai")
 _GROQ_RATE_LIMIT_FALLBACKS: tuple[str, ...] = (
     "openai/gpt-oss-20b",
     "llama-3.1-8b-instant",
@@ -720,6 +727,7 @@ class LLMClient:
         self._timeout_sec = max(5.0, float(timeout_sec))
         self._client_lock = threading.RLock()
         self._openai_client: OpenAI | None = None
+        self._failover_openai_clients: dict[tuple[str, str, str], OpenAI] = {}
         self._gemini_client: genai.Client | None = None
         self._model_cooldowns: dict[str, float] = {}
         self._unavailable_models: set[str] = set()
@@ -776,8 +784,12 @@ class LLMClient:
             if conn_changed:
                 old_oai = self._openai_client
                 old_gem = self._gemini_client
+                old_fb = list(self._failover_openai_clients.values())
                 self._openai_client = None
                 self._gemini_client = None
+                self._failover_openai_clients.clear()
+            else:
+                old_fb = []
             if conn_changed or model_changed:
                 self._model_cooldowns.clear()
                 self._unavailable_models.clear()
@@ -785,6 +797,8 @@ class LLMClient:
         self._register_config_secrets(config)
         self._close_sdk_client(old_oai)
         self._close_sdk_client(old_gem)
+        for fb_cli in old_fb:
+            self._close_sdk_client(fb_cli)
         if search_changed:
             clear_search_cache()
 
@@ -854,17 +868,37 @@ class LLMClient:
             return OpenAI(**kwargs)
 
         with self._client_lock:
-            if self._openai_client is None:
-                api_key, base_url = resolve_openai_settings(ref)
+            primary_sig = (
+                self.config.llm_provider.lower(),
+                *resolve_openai_settings(self.config),
+            )
+            req_sig = (ref.llm_provider.lower(), *resolve_openai_settings(ref))
+            if req_sig == primary_sig:
+                if self._openai_client is None:
+                    api_key, base_url = req_sig[1], req_sig[2]
+                    kwargs = {
+                        "api_key": api_key,
+                        "timeout": self._timeout_sec,
+                        "max_retries": 0,
+                    }
+                    if base_url:
+                        kwargs["base_url"] = base_url
+                    self._openai_client = OpenAI(**kwargs)
+                return self._openai_client
+
+            cache_key = (req_sig[0], req_sig[1], req_sig[2] or "")
+            cached = self._failover_openai_clients.get(cache_key)
+            if cached is None:
                 kwargs = {
-                    "api_key": api_key,
+                    "api_key": req_sig[1],
                     "timeout": self._timeout_sec,
                     "max_retries": 0,
                 }
-                if base_url:
-                    kwargs["base_url"] = base_url
-                self._openai_client = OpenAI(**kwargs)
-            return self._openai_client
+                if req_sig[2]:
+                    kwargs["base_url"] = req_sig[2]
+                cached = OpenAI(**kwargs)
+                self._failover_openai_clients[cache_key] = cached
+            return cached
 
     def _get_gemini_client(
         self, timeout_override: float | None = None, cfg: AppConfig | None = None
@@ -876,14 +910,21 @@ class LLMClient:
                 http_options=genai_types.HttpOptions(timeout=int(timeout_override * 1000)),
             )
         with self._client_lock:
-            if self._gemini_client is None:
-                self._gemini_client = genai.Client(
-                    api_key=ref.gemini_api_key,
-                    http_options=genai_types.HttpOptions(
-                        timeout=int(self._timeout_sec * 1000)
-                    ),
-                )
-            return self._gemini_client
+            if ref.gemini_api_key == self.config.gemini_api_key:
+                if self._gemini_client is None:
+                    self._gemini_client = genai.Client(
+                        api_key=ref.gemini_api_key,
+                        http_options=genai_types.HttpOptions(
+                            timeout=int(self._timeout_sec * 1000)
+                        ),
+                    )
+                return self._gemini_client
+            return genai.Client(
+                api_key=ref.gemini_api_key,
+                http_options=genai_types.HttpOptions(
+                    timeout=int(self._timeout_sec * 1000)
+                ),
+            )
 
     def active_model_name(self, cfg: AppConfig | None = None) -> str:
         ref = cfg or self.config
@@ -2160,6 +2201,311 @@ class LLMClient:
             deadline=deadline,
         )
 
+    def _resolve_failover_providers(self, cfg: AppConfig, primary_provider: str) -> list[str]:
+        fb = (cfg.llm_fallback_provider or "auto").strip().lower()
+        primary = primary_provider.strip().lower()
+        if fb == "none":
+            return []
+        if fb in VALID_LLM_PROVIDERS:
+            if fb == primary:
+                return []
+            fb_cfg = self._build_failover_config(cfg, fb)
+            return [fb] if has_valid_llm_credentials(fb_cfg) else []
+
+        candidates: list[str] = []
+        for prov in _AUTO_FAILOVER_ORDER:
+            if prov == primary:
+                continue
+            if get_provider_api_key(cfg, prov):
+                candidates.append(prov)
+        return candidates
+
+    @staticmethod
+    def _build_failover_config(cfg: AppConfig, target_provider: str) -> AppConfig:
+        from dataclasses import replace
+
+        return replace(cfg, llm_provider=target_provider, openai_base_url="")
+
+    @staticmethod
+    def _is_failover_eligible_error(exc: Exception) -> bool:
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return True
+        kind = _classify_api_error(exc)
+        if kind in {"quota", "timeout", "network", "auth", "not_found"}:
+            return True
+        code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+        if isinstance(code, int) and code >= 500:
+            return True
+        low = str(exc).lower()
+        return any(
+            tok in low
+            for tok in (
+                "429",
+                "500",
+                "502",
+                "503",
+                "504",
+                "overloaded",
+                "service unavailable",
+                "bad gateway",
+                "timed out",
+                "перевищено ліміт",
+                "перевищено час",
+                "порожню відповідь",
+                "недоступна",
+            )
+        )
+
+    def _stream_single_provider(
+        self,
+        *,
+        cfg: AppConfig,
+        transcript_text: str,
+        context_text: str,
+        effective_question: str,
+        detail_mode: str,
+        system_instruction: str,
+        user_prompt: str,
+        history: Sequence[tuple[str, str]],
+        max_tokens: int,
+        use_web: bool,
+        cancel_event: threading.Event | None,
+        on_status: Callable[[str], None] | None,
+        on_sources: Callable[[list[str]], None] | None,
+        screen_image_bytes: bytes | None,
+        screen_image_mime: str,
+        deadline: float,
+        cache_key: str | None = None,
+        on_model_used: Callable[[str, str], None] | None = None,
+        route_tag_override: str | None = None,
+    ) -> Iterator[str]:
+        has_image = bool(screen_image_bytes)
+        provider = cfg.llm_provider.lower()
+        configured_model = self.active_model_name(cfg)
+
+        model_override: str | None = None
+        route_tag = route_tag_override or ""
+        if provider == "groq" and has_image and _is_known_groq_text_only(configured_model):
+            model_override = _GROQ_VISION_MODEL
+            route_tag = route_tag_override or "vision"
+            if on_status is not None:
+                on_status(f"👁 Аналізую екран ({model_override})...")
+        elif provider == "cerebras" and has_image and _is_known_cerebras_text_only(configured_model):
+            model_override = _CEREBRAS_VISION_MODEL
+            route_tag = route_tag_override or "vision"
+            if on_status is not None:
+                on_status(f"👁 Аналізую екран ({model_override})...")
+        elif (
+            provider == "groq"
+            and not has_image
+            and self._is_model_cooling_down(configured_model)
+        ):
+            prefallback = self._pick_groq_fallback_model(
+                {configured_model.strip().lower()}, has_image=False
+            )
+            if prefallback:
+                model_override = prefallback
+                route_tag = "fallback"
+                if on_status is not None:
+                    on_status(
+                        f"⚡ Ліміт TPM на {configured_model} — одразу використовую {prefallback}..."
+                    )
+
+        attempted_models: set[str] = set()
+        short_waited = False
+        retried_empty = False
+        effective_max_tokens = max_tokens
+        last_exc: Exception | None = None
+
+        for _attempt in range(5):
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Перевищено загальний ліміт часу очікування ({configured_model})."
+                ) from last_exc
+
+            active_model = model_override or configured_model
+            attempted_models.add(active_model.strip().lower())
+            yielded_any = False
+            collected_text: list[str] = []
+            collected_sources: list[str] = []
+            route_state: dict[str, str] = {"model": active_model}
+
+            def _capture_sources(srcs: list[str], acc: list[str] = collected_sources) -> None:
+                acc[:] = list(srcs)
+                if on_sources is not None:
+                    on_sources(srcs)
+
+            try:
+                for chunk in self._stream_with_active_config(
+                    cfg=cfg,
+                    provider=provider,
+                    use_web=use_web,
+                    transcript_text=transcript_text,
+                    context_text=context_text,
+                    manual_question=effective_question,
+                    detail_mode=detail_mode,
+                    system_instruction=system_instruction,
+                    user_prompt=user_prompt,
+                    history=history,
+                    max_tokens=effective_max_tokens,
+                    cancel_event=cancel_event,
+                    on_status=on_status,
+                    on_sources=_capture_sources,
+                    model_override=model_override,
+                    screen_image_bytes=screen_image_bytes,
+                    screen_image_mime=screen_image_mime,
+                    deadline=deadline,
+                    route_state=route_state,
+                ):
+                    if not yielded_any:
+                        yielded_any = True
+                        resolved_model = route_state.get("model") or active_model
+                        if on_model_used is not None:
+                            lbl = (
+                                f"{provider} / {resolved_model}"
+                                if route_tag_override == "fallback"
+                                else resolved_model
+                            )
+                            on_model_used(lbl, route_tag)
+                    collected_text.append(chunk)
+                    yield chunk
+
+                resolved_model = route_state.get("model") or active_model
+                self._clear_model_cooldown(resolved_model)
+                full_text = "".join(collected_text)
+                if not full_text.strip() and (cancel_event is None or not cancel_event.is_set()):
+                    if not retried_empty:
+                        retried_empty = True
+                        effective_max_tokens = max(effective_max_tokens * 2, 1536)
+                        if on_status is not None:
+                            on_status("⏳ Порожня відповідь — повторюю запит...")
+                        continue
+                    raise RuntimeError(
+                        "Модель повернула порожню відповідь (ймовірно, ліміт токенів витратився "
+                        "на міркування або модель не підтримує зображення). Спробуйте збільшити "
+                        "Max tokens або обрати qwen-3.8-27b."
+                    )
+                if (
+                    cache_key is not None
+                    and full_text.strip()
+                    and (cancel_event is None or not cancel_event.is_set())
+                ):
+                    ttl = _RESPONSE_CACHE_WEB_TTL_SEC if use_web else _RESPONSE_CACHE_TTL_SEC
+                    with self._client_lock:
+                        if len(self._response_cache) >= _RESPONSE_CACHE_MAX_ITEMS:
+                            self._response_cache.popitem(last=False)
+                        self._response_cache[cache_key] = (
+                            time.monotonic(),
+                            ttl,
+                            full_text,
+                            collected_sources,
+                            resolved_model,
+                        )
+                return
+            except Exception as exc:
+                last_exc = exc
+                if yielded_any or (cancel_event is not None and cancel_event.is_set()):
+                    raise RuntimeError(self._format_stream_error(exc, active_model, cfg)) from exc
+
+                vision_target = (
+                    _GROQ_VISION_MODEL
+                    if provider == "groq"
+                    else (_CEREBRAS_VISION_MODEL if provider == "cerebras" else "")
+                )
+                if (
+                    has_image
+                    and vision_target
+                    and active_model != vision_target
+                    and vision_target.lower() not in attempted_models
+                    and _is_vision_rejected_error(exc)
+                ):
+                    logger.warning(
+                        "Model %s rejected image input; switching to %s",
+                        active_model,
+                        vision_target,
+                    )
+                    if on_status is not None:
+                        on_status(
+                            f"👁 Перемикаюсь на {vision_target} для аналізу екрана..."
+                        )
+                    model_override = vision_target
+                    route_tag = route_tag_override or "vision"
+                    continue
+
+                kind = _classify_api_error(exc)
+                if provider == "groq" and kind == "quota":
+                    retry_after = _extract_retry_after_seconds(exc)
+                    cooldown_sec = self._mark_model_cooldown(active_model, retry_after)
+                    if not has_image:
+                        next_model = self._pick_groq_fallback_model(
+                            attempted_models, has_image=False
+                        )
+                        if next_model:
+                            logger.warning(
+                                "Groq 429 TPM limit on %s (cooldown %.1fs); switching immediately to %s",
+                                active_model,
+                                cooldown_sec,
+                                next_model,
+                            )
+                            if on_status is not None:
+                                on_status(
+                                    f"⚡ Ліміт TPM (429) на {active_model} — миттєво перемикаюсь на {next_model}..."
+                                )
+                            model_override = next_model
+                            route_tag = "fallback"
+                            continue
+
+                    rem_budget = deadline - time.monotonic()
+                    if (
+                        retry_after is not None
+                        and retry_after <= 3.5
+                        and rem_budget > (retry_after + 1.5)
+                        and not short_waited
+                    ):
+                        short_waited = True
+                        if on_status is not None:
+                            on_status(f"⏳ Ліміт TPM (429) — повтор через {retry_after:.1f} с...")
+                        if cancel_event is not None:
+                            if cancel_event.wait(retry_after):
+                                return
+                        else:
+                            time.sleep(retry_after)
+                        continue
+
+                    wait_hint = f" (~{int(round(cooldown_sec))} с)" if cooldown_sec else ""
+                    raise RuntimeError(
+                        f"Вичерпано ліміт токенів Groq TPM (429) для {active_model}{wait_hint}. "
+                        "Спробуйте через кілька секунд, зменшіть обсяг контексту або оберіть іншу модель."
+                    ) from exc
+
+                if provider == "groq" and model_override is not None and kind == "not_found":
+                    with self._client_lock:
+                        self._unavailable_models.add(active_model.strip().lower())
+                    next_model = self._pick_groq_fallback_model(
+                        attempted_models, has_image=has_image
+                    )
+                    if next_model:
+                        logger.warning(
+                            "Groq fallback model %s unavailable; switching to %s",
+                            active_model,
+                            next_model,
+                        )
+                        if on_status is not None:
+                            on_status(
+                                f"⚡ Модель {active_model} недоступна — перемикаюсь на {next_model}..."
+                            )
+                        model_override = next_model
+                        route_tag = "fallback"
+                        continue
+
+                raise RuntimeError(self._format_stream_error(exc, active_model, cfg)) from exc
+
+        raise RuntimeError(
+            f"Не вдалося отримати відповідь від {configured_model} після кількох спроб."
+        ) from last_exc
+
     def stream_answer(
         self,
         transcript_text: str,
@@ -2178,7 +2524,7 @@ class LLMClient:
         bypass_cache: bool = False,
         on_model_used: Callable[[str, str], None] | None = None,
     ) -> Iterator[str]:
-        """Yield streamed response fragments from the configured LLM provider."""
+        """Yield streamed response fragments from the configured LLM provider with auto-failover."""
         has_image = bool(screen_image_bytes)
         if not transcript_text.strip() and not manual_question.strip() and not has_image:
             raise ValueError(
@@ -2253,220 +2599,86 @@ class LLMClient:
                     self._response_cache.pop(cache_key, None)
 
         deadline = time.monotonic() + (28.0 if detail_mode == "concise" else 50.0)
-        model_override: str | None = None
-        route_tag = ""
-        if provider == "groq" and has_image and _is_known_groq_text_only(configured_model):
-            model_override = _GROQ_VISION_MODEL
-            route_tag = "vision"
-            if on_status is not None:
-                on_status(f"👁 Аналізую екран ({model_override})...")
-        elif provider == "cerebras" and has_image and _is_known_cerebras_text_only(configured_model):
-            model_override = _CEREBRAS_VISION_MODEL
-            route_tag = "vision"
-            if on_status is not None:
-                on_status(f"👁 Аналізую екран ({model_override})...")
-        elif (
-            provider == "groq"
-            and not has_image
-            and self._is_model_cooling_down(configured_model)
-        ):
-            prefallback = self._pick_groq_fallback_model(
-                {configured_model.strip().lower()}, has_image=False
-            )
-            if prefallback:
-                model_override = prefallback
-                route_tag = "fallback"
-                if on_status is not None:
-                    on_status(
-                        f"⚡ Ліміт TPM на {configured_model} — одразу використовую {prefallback}..."
-                    )
+        yielded_primary = False
+        try:
+            for chunk in self._stream_single_provider(
+                cfg=cfg,
+                transcript_text=transcript_text,
+                context_text=context_text,
+                effective_question=effective_question,
+                detail_mode=detail_mode,
+                system_instruction=system_instruction,
+                user_prompt=user_prompt,
+                history=history,
+                max_tokens=max_tokens,
+                use_web=use_web,
+                cancel_event=cancel_event,
+                on_status=on_status,
+                on_sources=on_sources,
+                screen_image_bytes=screen_image_bytes,
+                screen_image_mime=screen_image_mime,
+                deadline=deadline,
+                cache_key=cache_key,
+                on_model_used=on_model_used,
+            ):
+                yielded_primary = True
+                yield chunk
+            return
+        except Exception as primary_exc:
+            if yielded_primary or (cancel_event is not None and cancel_event.is_set()):
+                raise
+            if not self._is_failover_eligible_error(primary_exc):
+                raise
+            fallback_providers = self._resolve_failover_providers(cfg, provider)
+            if not fallback_providers or (deadline - time.monotonic()) <= 3.0:
+                raise
 
-        attempted_models: set[str] = set()
-        short_waited = False
-        retried_empty = False
-        effective_max_tokens = max_tokens
-        last_exc: Exception | None = None
-
-        for _attempt in range(5):
-            if cancel_event is not None and cancel_event.is_set():
-                return
-            if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    f"Перевищено загальний ліміт часу очікування ({configured_model})."
-                ) from last_exc
-
-            active_model = model_override or configured_model
-            attempted_models.add(active_model.strip().lower())
-            yielded_any = False
-            collected_text: list[str] = []
-            collected_sources: list[str] = []
-            route_state: dict[str, str] = {"model": active_model}
-
-            def _capture_sources(srcs: list[str], acc: list[str] = collected_sources) -> None:
-                acc[:] = list(srcs)
-                if on_sources is not None:
-                    on_sources(srcs)
-
-            try:
-                for chunk in self._stream_with_active_config(
-                    cfg=cfg,
-                    provider=provider,
-                    use_web=use_web,
-                    transcript_text=transcript_text,
-                    context_text=context_text,
-                    manual_question=effective_question,
-                    detail_mode=detail_mode,
-                    system_instruction=system_instruction,
-                    user_prompt=user_prompt,
-                    history=history,
-                    max_tokens=effective_max_tokens,
-                    cancel_event=cancel_event,
-                    on_status=on_status,
-                    on_sources=_capture_sources,
-                    model_override=model_override,
-                    screen_image_bytes=screen_image_bytes,
-                    screen_image_mime=screen_image_mime,
-                    deadline=deadline,
-                    route_state=route_state,
-                ):
-                    if not yielded_any:
-                        yielded_any = True
-                        resolved_model = route_state.get("model") or active_model
-                        if on_model_used is not None:
-                            on_model_used(resolved_model, route_tag)
-                    collected_text.append(chunk)
-                    yield chunk
-
-                resolved_model = route_state.get("model") or active_model
-                self._clear_model_cooldown(resolved_model)
-                full_text = "".join(collected_text)
-                if not full_text.strip() and (cancel_event is None or not cancel_event.is_set()):
-                    if not retried_empty:
-                        retried_empty = True
-                        effective_max_tokens = max(effective_max_tokens * 2, 1536)
-                        if on_status is not None:
-                            on_status("⏳ Порожня відповідь — повторюю запит...")
-                        continue
-                    raise RuntimeError(
-                        "Модель повернула порожню відповідь (ймовірно, ліміт токенів витратився "
-                        "на міркування або модель не підтримує зображення). Спробуйте збільшити "
-                        "Max tokens або обрати qwen-3.8-27b."
-                    )
-                if (
-                    cache_key is not None
-                    and full_text.strip()
-                    and (cancel_event is None or not cancel_event.is_set())
-                ):
-                    ttl = _RESPONSE_CACHE_WEB_TTL_SEC if use_web else _RESPONSE_CACHE_TTL_SEC
-                    with self._client_lock:
-                        if len(self._response_cache) >= _RESPONSE_CACHE_MAX_ITEMS:
-                            self._response_cache.popitem(last=False)
-                        self._response_cache[cache_key] = (
-                            time.monotonic(),
-                            ttl,
-                            full_text,
-                            collected_sources,
-                            resolved_model,
-                        )
-                return
-            except Exception as exc:
-                last_exc = exc
-                if yielded_any or (cancel_event is not None and cancel_event.is_set()):
-                    raise RuntimeError(self._format_stream_error(exc, active_model, cfg)) from exc
-
-                vision_target = (
-                    _GROQ_VISION_MODEL
-                    if provider == "groq"
-                    else (_CEREBRAS_VISION_MODEL if provider == "cerebras" else "")
+            last_fb_exc: Exception = primary_exc
+            for fb_prov in fallback_providers:
+                if cancel_event is not None and cancel_event.is_set():
+                    return
+                if (deadline - time.monotonic()) <= 2.0:
+                    break
+                fb_cfg = self._build_failover_config(cfg, fb_prov)
+                fb_model = self.active_model_name(fb_cfg)
+                logger.warning(
+                    "Primary LLM %s failed (%s); auto-failing over to %s (%s)",
+                    provider,
+                    self._redact(str(primary_exc), cfg),
+                    fb_prov,
+                    fb_model,
                 )
-                if (
-                    has_image
-                    and vision_target
-                    and active_model != vision_target
-                    and vision_target.lower() not in attempted_models
-                    and _is_vision_rejected_error(exc)
-                ):
-                    logger.warning(
-                        "Model %s rejected image input; switching to %s",
-                        active_model,
-                        vision_target,
-                    )
-                    if on_status is not None:
-                        on_status(
-                            f"👁 Перемикаюсь на {vision_target} для аналізу екрана..."
-                        )
-                    model_override = vision_target
-                    route_tag = "vision"
-                    continue
-
-                kind = _classify_api_error(exc)
-                if provider == "groq" and kind == "quota":
-                    retry_after = _extract_retry_after_seconds(exc)
-                    cooldown_sec = self._mark_model_cooldown(active_model, retry_after)
-                    if not has_image:
-                        next_model = self._pick_groq_fallback_model(
-                            attempted_models, has_image=False
-                        )
-                        if next_model:
-                            logger.warning(
-                                "Groq 429 TPM limit on %s (cooldown %.1fs); switching immediately to %s",
-                                active_model,
-                                cooldown_sec,
-                                next_model,
-                            )
-                            if on_status is not None:
-                                on_status(
-                                    f"⚡ Ліміт TPM (429) на {active_model} — миттєво перемикаюсь на {next_model}..."
-                                )
-                            model_override = next_model
-                            route_tag = "fallback"
-                            continue
-
-                    rem_budget = deadline - time.monotonic()
-                    if (
-                        retry_after is not None
-                        and retry_after <= 3.5
-                        and rem_budget > (retry_after + 1.5)
-                        and not short_waited
+                if on_status is not None:
+                    on_status(f"⚡ Збій {provider} — авто-фолбек на {fb_prov} ({fb_model})...")
+                yielded_fb = False
+                try:
+                    for chunk in self._stream_single_provider(
+                        cfg=fb_cfg,
+                        transcript_text=transcript_text,
+                        context_text=context_text,
+                        effective_question=effective_question,
+                        detail_mode=detail_mode,
+                        system_instruction=system_instruction,
+                        user_prompt=user_prompt,
+                        history=history,
+                        max_tokens=max_tokens,
+                        use_web=use_web,
+                        cancel_event=cancel_event,
+                        on_status=on_status,
+                        on_sources=on_sources,
+                        screen_image_bytes=screen_image_bytes,
+                        screen_image_mime=screen_image_mime,
+                        deadline=deadline,
+                        cache_key=cache_key,
+                        on_model_used=on_model_used,
+                        route_tag_override="fallback",
                     ):
-                        short_waited = True
-                        if on_status is not None:
-                            on_status(f"⏳ Ліміт TPM (429) — повтор через {retry_after:.1f} с...")
-                        if cancel_event is not None:
-                            if cancel_event.wait(retry_after):
-                                return
-                        else:
-                            time.sleep(retry_after)
-                        continue
-
-                    wait_hint = f" (~{int(round(cooldown_sec))} с)" if cooldown_sec else ""
-                    raise RuntimeError(
-                        f"Вичерпано ліміт токенів Groq TPM (429) для {active_model}{wait_hint}. "
-                        "Спробуйте через кілька секунд, зменшіть обсяг контексту або оберіть іншу модель."
-                    ) from exc
-
-                if provider == "groq" and model_override is not None and kind == "not_found":
-                    with self._client_lock:
-                        self._unavailable_models.add(active_model.strip().lower())
-                    next_model = self._pick_groq_fallback_model(
-                        attempted_models, has_image=has_image
-                    )
-                    if next_model:
-                        logger.warning(
-                            "Groq fallback model %s unavailable; switching to %s",
-                            active_model,
-                            next_model,
-                        )
-                        if on_status is not None:
-                            on_status(
-                                f"⚡ Модель {active_model} недоступна — перемикаюсь на {next_model}..."
-                            )
-                        model_override = next_model
-                        route_tag = "fallback"
-                        continue
-
-                raise RuntimeError(self._format_stream_error(exc, active_model, cfg)) from exc
-
-        raise RuntimeError(
-            f"Не вдалося отримати відповідь від {configured_model} після кількох спроб."
-        ) from last_exc
+                        yielded_fb = True
+                        yield chunk
+                    return
+                except Exception as fb_exc:
+                    last_fb_exc = fb_exc
+                    if yielded_fb or (cancel_event is not None and cancel_event.is_set()):
+                        raise
+                    continue
+            raise last_fb_exc from primary_exc
