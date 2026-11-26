@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
-from PyQt6.QtCore import QRect
+from PyQt6.QtCore import QRect, Qt
 from PyQt6.QtGui import QColor, QPixmap
 from PyQt6.QtWidgets import QApplication, QTextBrowser
 from pynput import keyboard
@@ -277,6 +277,56 @@ def test_snip_hotkey_card_history_and_ui_fit() -> None:
         collected = dash._collect_config_from_ui()
         assert collected.llm_fallback_provider == "groq"
         assert collected.hotkey_snip == "ctrl+alt+k"
+    finally:
+        ov.close()
+        dash.force_close()
+
+
+def test_snip_arrow_cursor_and_honest_stealth_indicator(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    # Snip overlay uses normal arrow cursor instead of telltale crosshair
+    snip = screen_capture.ScreenSnipOverlay()
+    try:
+        assert snip.cursor().shape() == Qt.CursorShape.ArrowCursor
+    finally:
+        snip.close()
+
+    # Honest Stealth indicator reflects real OS read-back, never faking green on failure
+    monkeypatch.setattr(ui, "apply_window_display_affinity", lambda _hwnd, _on: False)
+    monkeypatch.setattr(dashboard, "apply_window_display_affinity", lambda _hwnd, _on: False)
+
+    ov = ui.CopilotOverlayWindow(stealth_enabled=True)
+    dash = dashboard.DashboardWindow(config=config.AppConfig(overlay_stealth=True, dashboard_stealth=True))
+    events: list[tuple[bool, bool]] = []
+    ov.stealth_status_changed.connect(lambda en, ok: events.append((en, ok)))
+    ov.stealth_status_changed.connect(dash.set_overlay_stealth)
+    try:
+        assert ov.set_stealth_mode(True) is False
+        assert ov.stealth_applied is False
+        assert ov._stealth_btn.property("stealth") == "off"
+        assert "Збій" in ov._stealth_btn.text()
+        assert events[-1] == (True, False)
+        assert dash._dot_stealth.property("status") == "error"
+        assert "ПОМИЛКА" in dash._lbl_stealth.text()
+
+        # When Windows confirms affinity, both overlay and dashboard switch to verified green
+        monkeypatch.setattr(ui, "apply_window_display_affinity", lambda _hwnd, _on: True)
+        monkeypatch.setattr(dashboard, "apply_window_display_affinity", lambda _hwnd, _on: True)
+        assert ov.set_stealth_mode(True) is True
+        assert ov.stealth_applied is True
+        assert ov._stealth_btn.property("stealth") == "on"
+        assert dash._dot_stealth.property("status") == "ok"
+        assert "Підтверджено Windows" in dash._lbl_stealth.text()
+
+        # If dashboard affinity fails while dashboard is visible, indicator flags error
+        dash.show()
+        app.processEvents()
+        monkeypatch.setattr(dashboard, "apply_window_display_affinity", lambda _hwnd, _on: False)
+        dash.set_dashboard_stealth(True)
+        assert dash._dot_stealth.property("status") == "error"
+        assert "панель керування НЕ захищена" in dash._lbl_stealth.text()
     finally:
         ov.close()
         dash.force_close()

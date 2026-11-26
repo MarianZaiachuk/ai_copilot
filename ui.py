@@ -755,6 +755,7 @@ class CopilotOverlayWindow(QWidget):
     snip_requested = pyqtSignal()
     device_selected = pyqtSignal(int)
     stealth_toggled = pyqtSignal(bool)
+    stealth_status_changed = pyqtSignal(bool, bool)
     opacity_changed = pyqtSignal(int)
     web_search_toggled = pyqtSignal(bool)
     screen_vision_toggled = pyqtSignal(bool)
@@ -1261,7 +1262,7 @@ class CopilotOverlayWindow(QWidget):
             self._title_layout.setSpacing(5)
             self._expand_btn.setText("▭")
             self._expand_btn.setToolTip("Згорнути в компактний режим")
-            self._stealth_btn.setText("Stealth: ON" if self._stealth_enabled else "⚠ Stealth: OFF")
+            self._refresh_stealth_btn()
             self.manual_input.setPlaceholderText(
                 "Додаткове питання або уточнення (Enter для надсилання)..."
             )
@@ -1273,7 +1274,7 @@ class CopilotOverlayWindow(QWidget):
             self._title_layout.setSpacing(3)
             self._expand_btn.setText("⤢")
             self._expand_btn.setToolTip("Розгорнути повний інтерфейс")
-            self._stealth_btn.setText("◈ Stealth" if self._stealth_enabled else "⚠ Викл.")
+            self._refresh_stealth_btn()
             self.manual_input.setPlaceholderText("Введіть питання (Enter)...")
             self.setMinimumSize(420, 260)
             self.resize(self._compact_size)
@@ -1561,35 +1562,42 @@ class CopilotOverlayWindow(QWidget):
 
     # --- Public state & UI callbacks ---
 
-    def set_stealth_mode(self, enabled: bool) -> bool:
-        """Apply or remove Windows WDA_EXCLUDEFROMCAPTURE on this overlay window."""
-        self._stealth_enabled = bool(enabled)
-        self._stealth_btn.setProperty("stealth", "on" if self._stealth_enabled else "off")
+    def _refresh_stealth_btn(self) -> None:
+        confirmed_on = self._stealth_enabled and self._stealth_applied
+        self._stealth_btn.setProperty("stealth", "on" if confirmed_on else "off")
         self._stealth_btn.style().unpolish(self._stealth_btn)
         self._stealth_btn.style().polish(self._stealth_btn)
 
-        if self._expanded:
-            self._stealth_btn.setText("Stealth: ON" if self._stealth_enabled else "⚠ Stealth: OFF")
-        else:
-            self._stealth_btn.setText("◈ Stealth" if self._stealth_enabled else "⚠ Викл.")
-
-        if self._stealth_enabled:
+        if confirmed_on:
+            self._stealth_btn.setText("Stealth: ON" if self._expanded else "◈ Stealth")
             self._stealth_btn.setToolTip(
-                "Stealth-режим завжди активний (невидимий на Zoom/Discord/OBS). Вимкнення — лише в Налаштуваннях → Оверлей."
+                "Stealth-режим підтверджено Windows (WDA_EXCLUDEFROMCAPTURE — невидимий на Zoom/Discord/OBS). "
+                "Вимкнення — лише в Налаштуваннях → Оверлей."
+            )
+        elif self._stealth_enabled:
+            self._stealth_btn.setText("⚠ Stealth: ЗБІЙ" if self._expanded else "⚠ Збій")
+            self._stealth_btn.setToolTip(
+                "УВАГА: Windows не підтвердила WDA_EXCLUDEFROMCAPTURE! Оверлей МОЖЕ бути видимим при демонстрації екрана."
             )
         else:
+            self._stealth_btn.setText("⚠ Stealth: OFF" if self._expanded else "⚠ Викл.")
             self._stealth_btn.setToolTip(
                 "УВАГА: Stealth-режим вимкнено в Налаштуваннях! Вікно видиме при демонстрації екрана."
             )
 
+    def set_stealth_mode(self, enabled: bool) -> bool:
+        """Apply or remove Windows WDA_EXCLUDEFROMCAPTURE on this overlay window."""
+        self._stealth_enabled = bool(enabled)
         hwnd = int(self.winId()) if self.winId() else 0
         ok = apply_window_display_affinity(hwnd, self._stealth_enabled)
         self._stealth_applied = ok
+        self._refresh_stealth_btn()
         if self._stealth_enabled and self.isVisible():
             if not self._stealth_guard_timer.isActive():
                 self._stealth_guard_timer.start()
         else:
             self._stealth_guard_timer.stop()
+        self.stealth_status_changed.emit(self._stealth_enabled, ok)
         return ok
 
     def _refresh_web_btn_label(self) -> None:

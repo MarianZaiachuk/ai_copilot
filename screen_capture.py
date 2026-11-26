@@ -294,7 +294,7 @@ class ScreenSnipOverlay(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
-        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
         self.setMouseTracking(True)
         self.setGeometry(self._virtual_rect)
 

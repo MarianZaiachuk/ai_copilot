@@ -546,6 +546,7 @@ class DashboardWindow(QWidget):
         self._hide_to_tray = False
         self._overlay_visible = False
         self._stealth_applied = False
+        self._overlay_stealth_applied: bool | None = None
         self._settings_save_rejected = False
         self._last_answer_markdown = ""
         self._qa_history_entries: list[tuple[str, str, str, list[str]]] = []
@@ -638,6 +639,8 @@ class DashboardWindow(QWidget):
                 self._stealth_guard_timer.start()
         else:
             self._stealth_guard_timer.stop()
+        if hasattr(self, "_dot_stealth"):
+            self.refresh_readiness()
         return ok
 
     def _verify_dashboard_stealth_affinity(self) -> None:
@@ -2639,12 +2642,21 @@ class DashboardWindow(QWidget):
             self._set_dot(self._dot_screen, "idle")
             self._lbl_screen.setText("Вимкнено (перемикач 👁 Екран)")
 
-        if self._config.overlay_stealth:
-            self._set_dot(self._dot_stealth, "ok")
-            self._lbl_stealth.setText("Увімкнено (невидимий на Screen Share)")
-        else:
+        if not self._config.overlay_stealth:
             self._set_dot(self._dot_stealth, "warn")
             self._lbl_stealth.setText("Вимкнено (видимий при записі екрана)")
+        elif self._overlay_stealth_applied is False:
+            self._set_dot(self._dot_stealth, "error")
+            self._lbl_stealth.setText("ПОМИЛКА: Windows не підтвердила захист оверлею!")
+        elif self._config.dashboard_stealth and self.isVisible() and not self._stealth_applied:
+            self._set_dot(self._dot_stealth, "error")
+            self._lbl_stealth.setText("ПОМИЛКА: панель керування НЕ захищена Windows!")
+        elif self._overlay_stealth_applied is True:
+            self._set_dot(self._dot_stealth, "ok")
+            self._lbl_stealth.setText("Підтверджено Windows (невидимий на Screen Share)")
+        else:
+            self._set_dot(self._dot_stealth, "warn")
+            self._lbl_stealth.setText("Очікує підтвердження Windows (DWM)...")
 
     def set_devices(self, devices: Iterable[AudioDeviceInfo]) -> None:
         current_data = self.home_device_combo.currentData()
@@ -2755,10 +2767,12 @@ class DashboardWindow(QWidget):
             return
         self._auto_save_settings_if_valid()
 
-    def set_overlay_stealth(self, enabled: bool) -> None:
-        """Synchronize overlay stealth state in dashboard config, settings UI, and readiness."""
+    def set_overlay_stealth(self, enabled: bool, applied: bool | None = None) -> None:
+        """Synchronize overlay stealth state, DWM verification status, settings UI, and readiness."""
         state = bool(enabled)
         self._config.overlay_stealth = state
+        if applied is not None:
+            self._overlay_stealth_applied = bool(applied)
         if self._ov_stealth_chk.isChecked() != state:
             self._ov_stealth_chk.blockSignals(True)
             self._ov_stealth_chk.setChecked(state)

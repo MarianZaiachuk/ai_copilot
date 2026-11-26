@@ -1560,6 +1560,7 @@ class CopilotController(QObject):
         self.overlay.screen_vision_toggled.connect(self.set_screen_vision_enabled)
         self.overlay.open_dashboard_requested.connect(self.show_dashboard)
         self.overlay.visibility_changed.connect(self.dashboard.set_overlay_visible)
+        self.overlay.stealth_status_changed.connect(self.dashboard.set_overlay_stealth)
 
         # Dashboard signals
         self.dashboard.refresh_devices_requested.connect(self.refresh_devices)
@@ -1600,8 +1601,8 @@ class CopilotController(QObject):
     def _on_overlay_stealth_toggled(self, enabled: bool) -> None:
         state = bool(enabled)
         self.config.overlay_stealth = state
-        self.overlay.set_stealth_mode(state)
-        self.dashboard.set_overlay_stealth(state)
+        applied = self.overlay.set_stealth_mode(state)
+        self.dashboard.set_overlay_stealth(state, applied)
         self._sync_tray_check_states()
         save_config_to_env(self.config)
 
@@ -2798,8 +2799,8 @@ class CopilotController(QObject):
         self.config = new_config
         self.llm_client.update_config(new_config)
 
-        self.overlay.set_stealth_mode(new_config.overlay_stealth)
-        self.dashboard.set_overlay_stealth(new_config.overlay_stealth)
+        ov_stealth_ok = self.overlay.set_stealth_mode(new_config.overlay_stealth)
+        self.dashboard.set_overlay_stealth(new_config.overlay_stealth, ov_stealth_ok)
         self.overlay.set_opacity_percent(new_config.overlay_opacity)
         self.overlay.set_font_scale(new_config.overlay_font_scale)
         self.overlay.set_web_search_enabled(new_config.web_search_enabled)
